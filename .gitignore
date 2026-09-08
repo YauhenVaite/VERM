@@ -1,0 +1,26 @@
+# --- Виртуальное окружение ---
+.venv/
+venv/
+env/
+
+# --- Python: байткод и кэш ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Общие данные: игнорируем всё, кроме config.json ---
+data/*
+!data/config.json
+
+# --- IDE / редакторы ---
+.vscode/
+.idea/
+*.swp
+
+# --- ОС ---
+Thumbs.db
+.DS_Store
