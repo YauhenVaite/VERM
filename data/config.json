@@ -1,5 +1,7 @@
 {
   "appearance_mode": "System",
   "color_theme": "blue",
-  "window_size": "560x680"
+  "window_size": "560x680",
+  "dbase_auto_start": true,
+  "dbase_interval_minutes": 30
 }
