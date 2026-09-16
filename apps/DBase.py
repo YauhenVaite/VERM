@@ -4,19 +4,30 @@
 изменять или удалять таблицы и колонки (структуру) SQLite-базы данных.
 Все остальные модули могут только читать, добавлять или обновлять строки.
 
-При запуске модуль выполняет монолитный алгоритм первой инициализации:
-  1) получает токен Wildberries для категории CONTENT через get_wb_token() из .env
+При запуске модуль выполняет монолитный алгоритм инициализации:
+
+  Wildberries:
+  1) получает токен категории CONTENT через get_wb_token() из .env
      (при отсутствии специализированного токена используется мастер-токен);
   2) создаёт/обновляет схему БД;
-  3) выгружает все карточки товаров (пагинация курсором) и заполняет
-     wb_products (корневые параметры) и wb_product_values (динамические
-     характеристики);
-  4) опрашивает справочник характеристик Wildberries по уникальным
-     категориям и заполняет таблицу wb_charcs шаблонами полей.
+  3) выгружает карточки товаров (пагинация курсором) и заполняет
+     wb_products (корневые параметры) и wb_product_values (характеристики);
+  4) опрашивает справочник характеристик Wildberries и заполняет wb_charcs.
+
+  Ozon (необязательно — пропускается без OZ_MASTER_TOKEN / OZON_CLIENT_ID):
+  5) выгружает список товаров (/v3/product/list) и их детали
+     (/v3/product/info/list), раскладывая активные карточки в oz_products,
+     архивные — в oz_archive, а атрибуты активных — в oz_product_values;
+  6) опрашивает справочник атрибутов (/v1/description-category/attribute)
+     и заполняет oz_charcs.
 
 Схема построена под реальный формат ответов Wildberries API v2:
   * POST /content/v2/get/cards/list — список карточек (пагинация курсором);
-  * GET  /content/v2/object/charcs/{subjectId} — метаданные характеристик.
+  * GET  /content/v2/object/charcs/{subjectId} — метаданные характеристик;
+и Ozon Seller API:
+  * POST /v3/product/list — список товаров (пагинация last_id);
+  * POST /v3/product/info/list — детали товаров (батчами по product_id);
+  * POST /v1/description-category/attribute — справочник атрибутов.
 
 База данных хранится в data/inventory.db.
 """
@@ -244,10 +255,61 @@ CHARC_EXTRA_COLUMNS = {
 }
 
 # Таблицы с составным ключом UNIQUE(ART, SUP).
-_ART_SUP_TABLES = ("status", "wb_products")
+_ART_SUP_TABLES = ("status", "wb_products", "oz_products", "oz_archive")
 
 # Таблицы значений с составным ключом UNIQUE(ART, SUP, charcID).
 _EAV_TABLES = ("wb_product_values",)
+
+# Таблицы значений Ozon: ключ UNIQUE(ART, SUP, attribute_id) (не charcID).
+_OZ_EAV_TABLES = ("oz_product_values",)
+
+# ---------------------------------------------------------------------------
+# Интеграция с Ozon Seller API.
+# ---------------------------------------------------------------------------
+OZ_API_BASE_URL = "https://api-seller.ozon.ru"
+OZ_PRODUCT_LIST_URL = f"{OZ_API_BASE_URL}/v3/product/list"
+OZ_PRODUCT_INFO_LIST_URL = f"{OZ_API_BASE_URL}/v3/product/info/list"
+OZ_ATTRIBUTE_URL = f"{OZ_API_BASE_URL}/v1/description-category/attribute"
+OZ_PRODUCT_ATTRIBUTES_URL = f"{OZ_API_BASE_URL}/v4/product/info/attributes"
+
+# Размер страницы списка товаров и размер батча деталей (product/info/list).
+OZ_PAGE_SIZE = 100
+OZ_INFO_BATCH_SIZE = 1000
+
+# Колонки таблиц oz_products / oz_archive (известные скалярные поля ответа
+# product/info/list). Остальные скалярные поля добавляются автоматически.
+# Поля id/barcodes/images обрабатываются нестандартно (см. OZ_SPECIAL_KEYS).
+OZ_PRODUCT_COLUMNS = {
+    "offer_id": "TEXT",
+    "name": "TEXT",
+    "product_id": "INTEGER",      # из поля id
+    "sku": "INTEGER",
+    "barcode": "TEXT",             # из поля barcodes (склейка)
+    "description_category_id": "INTEGER",
+    "type_id": "INTEGER",
+    "price": "TEXT",
+    "old_price": "TEXT",
+    "min_price": "TEXT",
+    "currency_code": "TEXT",
+    "vat": "TEXT",
+    "is_archived": "INTEGER",
+    "is_autoarchived": "INTEGER",
+    "is_discounted": "INTEGER",
+    "is_prepayment_allowed": "INTEGER",
+    "volume_weight": "REAL",
+    "height": "INTEGER",
+    "depth": "INTEGER",
+    "width": "INTEGER",
+    "weight": "INTEGER",
+    "dimension_unit": "TEXT",
+    "weight_unit": "TEXT",
+    "created_at": "TEXT",
+    "updated_at": "TEXT",
+    "images": "TEXT",              # JSON
+}
+
+# Поля product/info/list, раскладываемые нестандартно (не в одноимённую колонку).
+OZ_SPECIAL_KEYS = frozenset({"id", "barcodes", "images"})
 
 _logger = logging.getLogger("DBase")
 
@@ -291,6 +353,36 @@ def _products_columns_sql() -> str:
     return ", ".join(
         f"{name} {col_type}" for name, col_type in PRODUCT_ROOT_COLUMNS.items()
     )
+
+
+def _oz_products_columns_sql() -> str:
+    """SQL-фрагмент корневых колонок таблиц oz_products / oz_archive."""
+    return ", ".join(
+        f"{name} {col_type}" for name, col_type in OZ_PRODUCT_COLUMNS.items()
+    )
+
+
+def _drop_legacy_oz_tables(cursor) -> None:
+    """Удаляет таблицы Ozon старой схемы (они пересоздаются с нуля).
+
+    Ozon-этап — это полный пересбор каталога при каждом запуске, поэтому
+    такие таблицы можно безопасно пересоздавать. Признак устаревшей схемы —
+    отсутствие колонки field_name в oz_product_values (таблицы создавались
+    до актуализации схемы).
+    """
+    has_values = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='oz_product_values'"
+    ).fetchone()
+    if not has_values:
+        return
+
+    values_cols = {row[1] for row in cursor.execute("PRAGMA table_info(oz_product_values)")}
+    if "field_name" in values_cols:
+        return
+
+    for table in ("oz_products", "oz_archive", "oz_product_values", "oz_charcs"):
+        cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    _logger.info("Ozon: удалены таблицы старой схемы (будут пересозданы).")
 
 
 def _create_tables(connection: sqlite3.Connection) -> None:
@@ -366,6 +458,71 @@ def _create_tables(connection: sqlite3.Connection) -> None:
         """
     )
 
+    # Ozon: удаляем таблицы устаревшей схемы перед (пере)созданием.
+    _drop_legacy_oz_tables(cursor)
+
+    # Ozon: справочник атрибутов из /v1/description-category/attribute.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oz_charcs (
+            attribute_id INTEGER PRIMARY KEY,
+            name TEXT,
+            description TEXT,
+            is_required INTEGER,
+            is_collection INTEGER,
+            is_aspect INTEGER,
+            data_type TEXT,
+            dictionary_id INTEGER,
+            max_value_count INTEGER,
+            group_name TEXT
+        )
+        """
+    )
+
+    # Ozon: активные карточки (корневые параметры).
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS oz_products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ART TEXT NOT NULL,
+            SUP TEXT,
+            {_oz_products_columns_sql()},
+            UNIQUE(ART, SUP)
+        )
+        """
+    )
+
+    # Ozon: архивные карточки (тот же набор корневых колонок, что и oz_products).
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS oz_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ART TEXT NOT NULL,
+            SUP TEXT,
+            {_oz_products_columns_sql()},
+            UNIQUE(ART, SUP)
+        )
+        """
+    )
+
+    # Ozon: динамические значения активных карточек (EAV-паттерн).
+    # attribute_id — ссылка на oz_charcs (атрибуты); field_name — имя вложенного
+    # поля верхнего уровня (sources, commissions, stocks и т.п., хранится JSON).
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oz_product_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ART TEXT NOT NULL,
+            SUP TEXT,
+            attribute_id INTEGER,
+            field_name TEXT,
+            value TEXT,
+            FOREIGN KEY(attribute_id) REFERENCES oz_charcs(attribute_id),
+            UNIQUE(ART, SUP, attribute_id)
+        )
+        """
+    )
+
     connection.commit()
 
 
@@ -390,6 +547,12 @@ def _create_unique_indexes(connection: sqlite3.Connection) -> None:
         cursor.execute(
             f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_art_charcid_null_sup "
             f"ON {table} (ART, charcID) WHERE SUP IS NULL"
+        )
+
+    for table in _OZ_EAV_TABLES:
+        cursor.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_art_attributeid_null_sup "
+            f"ON {table} (ART, attribute_id) WHERE SUP IS NULL"
         )
 
     connection.commit()
@@ -670,6 +833,8 @@ class WBRateLimiter:
         "STATISTICS": {"max_tokens": 2, "refill_rate": 2.0},
         "PROMOTION": {"max_tokens": 2, "refill_rate": 2.0},
         "FEEDBACKS": {"max_tokens": 2, "refill_rate": 2.0},
+        # Ozon Seller API: базовый безопасный лимит (уточняется при необходимости).
+        "OZ": {"max_tokens": 2, "refill_rate": 2.0},
     }
 
     _DEFAULT_FALLBACK = {"max_tokens": 2, "refill_rate": 2.0}
@@ -866,11 +1031,11 @@ def _save_cursor(cursor_meta):
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
-def _http_request(session, method, url, *, json_body=None, retries=3, retry_delay=5):
+def _http_request(session, method, url, *, json_body=None, retries=3, retry_delay=5, rate_category="CONTENT"):
     """Синхронный HTTP-запрос с ретраями при 429 и сетевых ошибках."""
     for attempt in range(1, retries + 1):
         # Пропускаем запрос через Rate Limiter перед каждым вызовом API.
-        LIMITER.wait_for_token("CONTENT")
+        LIMITER.wait_for_token(rate_category)
         try:
             if method == "POST":
                 response = session.post(url, json=json_body, timeout=60)
@@ -1178,6 +1343,510 @@ def _process_card(db_cursor, card, categories, counters):
     return _upsert_product(db_cursor, art, sup, root_values)
 
 
+# ---------------------------------------------------------------------------
+# Ozon Seller API: выгрузка товаров и атрибутов
+# ---------------------------------------------------------------------------
+def _chunks(items, size):
+    """Делит список на последовательные порции размером size."""
+    for index in range(0, len(items), size):
+        yield items[index:index + size]
+
+
+def _is_oz_archived(item):
+    """Определяет, находится ли товар Ozon в архиве.
+
+    Ozon возвращает признак `is_archived` (bool) в ответе product/info/list.
+    """
+    return bool(item.get("is_archived"))
+
+
+def _fetch_oz_product_list(session, last_id=""):
+    """Запрашивает одну страницу списка товаров Ozon (пагинация last_id)."""
+    payload = {
+        "filter": {"visibility": "ALL"},
+        "last_id": last_id,
+        "limit": OZ_PAGE_SIZE,
+    }
+    response = _http_request(
+        session, "POST", OZ_PRODUCT_LIST_URL, json_body=payload, rate_category="OZ"
+    )
+    return _parse_json(response)
+
+
+def _fetch_oz_product_info_list(session, product_ids):
+    """Запрашивает детали товаров Ozon батчем по списку product_id."""
+    payload = {"product_id": product_ids}
+    response = _http_request(
+        session, "POST", OZ_PRODUCT_INFO_LIST_URL, json_body=payload, rate_category="OZ"
+    )
+    return _parse_json(response)
+
+
+def _fetch_oz_attributes(session, description_category_id, type_id):
+    """Запрашивает справочник атрибутов категории Ozon."""
+    payload = {
+        "description_category_id": description_category_id,
+        "type_id": type_id,
+        "language": "RU",
+    }
+    response = _http_request(
+        session, "POST", OZ_ATTRIBUTE_URL, json_body=payload, rate_category="OZ"
+    )
+    data = _parse_json(response)
+    result = data.get("result")
+    return result if isinstance(result, list) else []
+def _serialize_oz_attribute_values(values):
+    """Сводит `values` атрибута Ozon (v4) к строке для oz_product_values.
+
+    Ozon отдаёт значения списком объектов {"dictionary_value_id": ..., "value": ...}
+    либо строк. Один элемент сводится к скаляру, несколько — склеиваются запятой.
+    """
+    if not isinstance(values, list) or not values:
+        return None
+
+    parts = []
+    for item in values:
+        if isinstance(item, dict):
+            value = item.get("value")
+        else:
+            value = item
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            parts.append(text)
+
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts)
+
+
+def _fetch_oz_product_attributes(session, product_ids):
+    """Запрашивает характеристики товаров Ozon (v4, пагинация last_id)."""
+    payload = {
+        "filter": {"product_id": [str(pid) for pid in product_ids], "visibility": "ALL"},
+        "limit": OZ_INFO_BATCH_SIZE,
+    }
+    items = []
+    last_id = ""
+    while True:
+        body = dict(payload)
+        if last_id:
+            body["last_id"] = last_id
+        response = _http_request(
+            session, "POST", OZ_PRODUCT_ATTRIBUTES_URL, json_body=body, rate_category="OZ"
+        )
+        data = _parse_json(response)
+        result = data.get("result") or []
+        if isinstance(result, list):
+            items.extend(result)
+        last_id = data.get("last_id") or ""
+        if not last_id:
+            break
+    return items
+
+
+def _ensure_oz_product_columns(db_cursor, values: dict) -> None:
+    """Добавляет в oz_products и oz_archive недостающие колонки под новые поля."""
+    for table in ("oz_products", "oz_archive"):
+        existing = {row[1] for row in db_cursor.execute(f"PRAGMA table_info({table})")}
+        for name, value in values.items():
+            if name in existing or not SQL_IDENTIFIER_RE.match(name):
+                continue
+            col_type = _infer_sql_type(value)
+            db_cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+            existing.add(name)
+
+
+def _upsert_oz_row(db_cursor, table, art, sup, root_values):
+    """Вставляет или обновляет корневые параметры товара в таблице Ozon.
+
+    Помимо известных колонок OZ_PRODUCT_COLUMNS учитывает новые скалярные
+    поля из root_values: под них автоматически создаются колонки.
+    `table` — строго "oz_products" либо "oz_archive" (внутренняя константа).
+    """
+    columns = list(OZ_PRODUCT_COLUMNS)
+    extra = [
+        name for name in root_values
+        if name not in columns and SQL_IDENTIFIER_RE.match(name)
+    ]
+    if extra:
+        _ensure_oz_product_columns(db_cursor, {name: root_values[name] for name in extra})
+        columns.extend(extra)
+
+    if sup is None:
+        existing = db_cursor.execute(
+            f"SELECT id FROM {table} WHERE ART = ? AND SUP IS NULL", (art,)
+        ).fetchone()
+    else:
+        existing = db_cursor.execute(
+            f"SELECT id FROM {table} WHERE ART = ? AND SUP = ?", (art, sup)
+        ).fetchone()
+
+    values = [root_values.get(col) for col in columns]
+
+    if existing is None:
+        cols = ["ART", "SUP"] + columns
+        placeholders = ", ".join(["?"] * len(cols))
+        db_cursor.execute(
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+            [art, sup] + values,
+        )
+        return "insert"
+
+    assignments = ", ".join(f"{col} = ?" for col in columns)
+    db_cursor.execute(
+        f"UPDATE {table} SET {assignments} WHERE id = ?",
+        values + [existing[0]],
+    )
+    return "update"
+
+
+def _delete_oz_row(db_cursor, table, art, sup):
+    """Удаляет строку товара из таблицы Ozon по связке ART + SUP."""
+    if sup is None:
+        db_cursor.execute(
+            f"DELETE FROM {table} WHERE ART = ? AND SUP IS NULL", (art,)
+        )
+    else:
+        db_cursor.execute(
+            f"DELETE FROM {table} WHERE ART = ? AND SUP = ?", (art, sup)
+        )
+
+
+def _delete_oz_product_values(db_cursor, art, sup):
+    """Удаляет все атрибуты активной карточки Ozon (по связке ART + SUP)."""
+    if sup is None:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values WHERE ART = ? AND SUP IS NULL", (art,)
+        )
+    else:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values WHERE ART = ? AND SUP = ?", (art, sup)
+        )
+
+
+def _delete_oz_field_values(db_cursor, art, sup):
+    """Удаляет только универсальные поля (field_name) карточки Ozon."""
+    if sup is None:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values "
+            "WHERE ART = ? AND SUP IS NULL AND attribute_id IS NULL", (art,)
+        )
+    else:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values "
+            "WHERE ART = ? AND SUP = ? AND attribute_id IS NULL", (art, sup)
+        )
+
+
+def _delete_oz_attribute_values(db_cursor, art, sup):
+    """Удаляет только атрибуты (attribute_id) карточки Ozon."""
+    if sup is None:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values "
+            "WHERE ART = ? AND SUP IS NULL AND attribute_id IS NOT NULL", (art,)
+        )
+    else:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values "
+            "WHERE ART = ? AND SUP = ? AND attribute_id IS NOT NULL", (art, sup)
+        )
+
+
+def _delete_oz_named_field(db_cursor, art, sup, field_name):
+    """Удаляет конкретное универсальное поле (field_name) карточки Ozon."""
+    if sup is None:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values "
+            "WHERE ART = ? AND SUP IS NULL AND attribute_id IS NULL AND field_name = ?",
+            (art, field_name),
+        )
+    else:
+        db_cursor.execute(
+            "DELETE FROM oz_product_values "
+            "WHERE ART = ? AND SUP = ? AND attribute_id IS NULL AND field_name = ?",
+            (art, sup, field_name),
+        )
+
+
+def _insert_oz_product_value(db_cursor, art, sup, attribute_id, field_name, value):
+    """Вставляет строку в oz_product_values (атрибут или универсальное поле).
+
+    Для атрибута: attribute_id задан, field_name = None.
+    Для универсального вложенного поля: attribute_id = None, field_name задан,
+    value — сериализованный JSON.
+    """
+    db_cursor.execute(
+        "INSERT INTO oz_product_values (ART, SUP, attribute_id, field_name, value) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (art, sup, attribute_id, field_name, value),
+    )
+
+
+def _upsert_oz_charc(db_cursor, attr):
+    """Записывает атрибут справочника Ozon в oz_charcs."""
+    attribute_id = attr.get("id")
+    if attribute_id is None:
+        return None
+
+    name = attr.get("name") or ""
+    description = attr.get("description") or ""
+    is_required = 1 if attr.get("is_required") else 0
+    is_collection = 1 if attr.get("is_collection") else 0
+    is_aspect = 1 if attr.get("is_aspect") else 0
+    data_type = str(attr.get("type") or "")
+    dictionary_id = attr.get("dictionary_id")
+    max_value_count = attr.get("max_value_count") or 0
+    group_name = attr.get("group_name") or ""
+
+    row = db_cursor.execute(
+        "SELECT 1 FROM oz_charcs WHERE attribute_id = ?", (attribute_id,)
+    ).fetchone()
+
+    if row is None:
+        db_cursor.execute(
+            "INSERT INTO oz_charcs "
+            "(attribute_id, name, description, is_required, is_collection, is_aspect, "
+            "data_type, dictionary_id, max_value_count, group_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (attribute_id, name, description, is_required, is_collection, is_aspect,
+             data_type, dictionary_id, max_value_count, group_name),
+        )
+        return "insert"
+
+    db_cursor.execute(
+        "UPDATE oz_charcs SET name = ?, description = ?, is_required = ?, "
+        "is_collection = ?, is_aspect = ?, data_type = ?, dictionary_id = ?, "
+        "max_value_count = ?, group_name = ? WHERE attribute_id = ?",
+        (name, description, is_required, is_collection, is_aspect, data_type,
+         dictionary_id, max_value_count, group_name, attribute_id),
+    )
+    return "update"
+def _process_oz_card(db_cursor, item, categories, counters):
+    """Обрабатывает один товар Ozon: раскладывает в oz_products/oz_archive.
+
+    Активные карточки пишутся в oz_products (+ вложенные поля в oz_product_values),
+    архивные — в oz_archive (только корневой снимок). Возвращает строку-итог
+    ("product_insert", "product_update", "archive_insert", "archive_update")
+    или None, если из offer_id не удалось извлечь артикул.
+    """
+    art, sup = extract_art_sup(item.get("offer_id"))
+    if art is None:
+        return None
+
+    description_category_id = item.get("description_category_id")
+    type_id = item.get("type_id")
+    if description_category_id is not None and type_id is not None:
+        categories.setdefault((description_category_id, type_id), True)
+
+    root_values = {}
+    eav_entries = []
+    for key, value in item.items():
+        if value is None:
+            continue
+        if key == "id":
+            root_values["product_id"] = value
+        elif key == "barcodes":
+            root_values["barcode"] = _first_or_join(value)
+        elif key == "images":
+            root_values["images"] = _json_dumps(value)
+        elif isinstance(value, (dict, list)):
+            if not value:
+                continue
+            eav_entries.append((None, key, _json_dumps(value)))
+        else:
+            root_values[key] = value
+
+    if _is_oz_archived(item):
+        # Переезд в архив: чистим активную запись и её значения.
+        _delete_oz_row(db_cursor, "oz_products", art, sup)
+        _delete_oz_product_values(db_cursor, art, sup)
+        result = _upsert_oz_row(db_cursor, "oz_archive", art, sup, root_values)
+        return f"archive_{result}" if result else None
+
+    # Активная карточка: убираем возможный старый архивный снимок.
+    _delete_oz_row(db_cursor, "oz_archive", art, sup)
+
+    if eav_entries:
+        _delete_oz_field_values(db_cursor, art, sup)
+        for attribute_id, field_name, value in eav_entries:
+            _insert_oz_product_value(db_cursor, art, sup, attribute_id, field_name, value)
+            counters["values_inserted"] += 1
+
+    result = _upsert_oz_row(db_cursor, "oz_products", art, sup, root_values)
+    return f"product_{result}" if result else None
+
+
+def _update_oz_dimensions(db_cursor, art, sup, item):
+    """Обновляет габариты активного товара Ozon (не трогая остальные колонки)."""
+    dims = {}
+    for col in ("height", "depth", "width", "weight", "dimension_unit", "weight_unit"):
+        if item.get(col) is not None:
+            dims[col] = item[col]
+    if not dims:
+        return
+
+    assignments = ", ".join(f"{col} = ?" for col in dims)
+    values = [dims[col] for col in dims]
+    if sup is None:
+        db_cursor.execute(
+            f"UPDATE oz_products SET {assignments} WHERE ART = ? AND SUP IS NULL",
+            values + [art],
+        )
+    else:
+        db_cursor.execute(
+            f"UPDATE oz_products SET {assignments} WHERE ART = ? AND SUP = ?",
+            values + [art, sup],
+        )
+
+
+def _process_oz_attributes_item(db_cursor, item, counters):
+    """Обрабатывает характеристики товара из /v4/product/info/attributes.
+
+    Записывает атрибуты (attribute_id + value) в oz_product_values, габариты
+    в oz_products, а вспомогательные структуры complex_attributes и
+    attributes_with_defaults — JSON по field_name. Возвращает число записанных
+    значений.
+    """
+    art, sup = extract_art_sup(item.get("offer_id"))
+    if art is None:
+        return 0
+
+    _update_oz_dimensions(db_cursor, art, sup, item)
+
+    attr_entries = []
+    for attr in item.get("attributes") or []:
+        attribute_id = attr.get("id")
+        if attribute_id is None:
+            continue
+        value = _serialize_oz_attribute_values(attr.get("values"))
+        if value is None:
+            continue
+        attr_entries.append((attribute_id, None, value))
+
+    written = 0
+    if attr_entries:
+        _delete_oz_attribute_values(db_cursor, art, sup)
+        for attribute_id, field_name, value in attr_entries:
+            _insert_oz_product_value(db_cursor, art, sup, attribute_id, field_name, value)
+            counters["values_inserted"] += 1
+            written += 1
+
+    # Вспомогательные структуры: вложенные характеристики и id со значениями
+    # по умолчанию — сохраняем как JSON по field_name (чтобы не терять данные).
+    for field_name in ("complex_attributes", "attributes_with_defaults"):
+        value = item.get(field_name)
+        if not value:
+            continue
+        _delete_oz_named_field(db_cursor, art, sup, field_name)
+        _insert_oz_product_value(db_cursor, art, sup, None, field_name, _json_dumps(value))
+        counters["values_inserted"] += 1
+        written += 1
+
+    return written
+
+
+def _sync_oz(connection):
+    """Синхронизирует таблицы Ozon (необязательный этап инициализации).
+
+    Если токен Ozon или Client-Id не заполнены — этап молча пропускается,
+    чтобы не ломать выгрузку Wildberries.
+    """
+    oz_api_key = get_oz_token()
+    oz_client_id = get_oz_client_id()
+    if not oz_api_key or not oz_client_id:
+        print("[DBase] Ozon: пропуск — не заполнены OZ_MASTER_TOKEN / OZON_CLIENT_ID.")
+        _logger.info("Ozon: пропуск — отсутствует токен или Client-Id.")
+        return
+
+    session = requests.Session()
+    session.headers.update({
+        "Client-Id": oz_client_id,
+        "Api-Key": oz_api_key,
+        "Content-Type": "application/json",
+    })
+
+    counters = {
+        "items": 0,
+        "products_inserted": 0,
+        "products_updated": 0,
+        "archive_inserted": 0,
+        "archive_updated": 0,
+        "values_inserted": 0,
+        "charcs_inserted": 0,
+        "charcs_updated": 0,
+    }
+    db_cursor = connection.cursor()
+
+    try:
+        print("[DBase] Ozon: получаю список товаров…")
+        product_ids = []
+        last_id = ""
+        while True:
+            data = _fetch_oz_product_list(session, last_id)
+            result = data.get("result") or {}
+            items = result.get("items") or []
+            if not items:
+                break
+            for item in items:
+                pid = item.get("product_id")
+                if pid is not None:
+                    product_ids.append(pid)
+            last_id = result.get("last_id") or ""
+            if not last_id:
+                break
+
+        print(f"[DBase] Ozon: найдено товаров: {len(product_ids)}.")
+        _logger.info("Ozon: найдено товаров: %d.", len(product_ids))
+
+        categories = {}
+        for batch in _chunks(product_ids, OZ_INFO_BATCH_SIZE):
+            data = _fetch_oz_product_info_list(session, batch)
+            for item in (data.get("items") or []):
+                counters["items"] += 1
+                outcome = _process_oz_card(db_cursor, item, categories, counters)
+                if outcome == "product_insert":
+                    counters["products_inserted"] += 1
+                elif outcome == "product_update":
+                    counters["products_updated"] += 1
+                elif outcome == "archive_insert":
+                    counters["archive_inserted"] += 1
+                elif outcome == "archive_update":
+                    counters["archive_updated"] += 1
+            connection.commit()
+
+        # Характеристики товаров (атрибуты + габариты) — отдельный метод v4.
+        for batch in _chunks(product_ids, OZ_INFO_BATCH_SIZE):
+            for item in _fetch_oz_product_attributes(session, batch):
+                _process_oz_attributes_item(db_cursor, item, counters)
+            connection.commit()
+
+        for (description_category_id, type_id) in categories:
+            print(
+                f"[DBase] Ozon: опрашиваю атрибуты категории "
+                f"{description_category_id} (тип {type_id})."
+            )
+            attributes = _fetch_oz_attributes(session, description_category_id, type_id)
+            for attr in attributes:
+                result = _upsert_oz_charc(db_cursor, attr)
+                if result == "insert":
+                    counters["charcs_inserted"] += 1
+                elif result == "update":
+                    counters["charcs_updated"] += 1
+            connection.commit()
+
+        print(
+            f"[DBase] Ozon: oz_products(+{counters['products_inserted']}/~{counters['products_updated']}), "
+            f"oz_archive(+{counters['archive_inserted']}/~{counters['archive_updated']}), "
+            f"oz_product_values(+{counters['values_inserted']}), "
+            f"oz_charcs(+{counters['charcs_inserted']}/~{counters['charcs_updated']})."
+        )
+        _logger.info("Ozon: синхронизация завершена (%s).", counters)
+    finally:
+        session.close()
 def run() -> None:
     """Главная функция модуля. Вызывается лаунчером в отдельном потоке."""
     _configure_logging()
@@ -1312,6 +1981,9 @@ def run() -> None:
             "Справочник wb_charcs: добавлено %d, обновлено %d характеристик.",
             charcs_inserted, charcs_updated,
         )
+
+        # 5. Синхронизация Ozon (необязательная — пропускается без токена/Client-Id).
+        _sync_oz(connection)
 
         elapsed = time.perf_counter() - started
         print(f"[DBase] Скачано карточек: {counters['cards']}")

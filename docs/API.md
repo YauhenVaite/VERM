@@ -5,11 +5,12 @@
 
 > Папка `BOT/` в этой документации не учитывается.
 
-Все обращения к внешним API в рамках лаунчера и его модулей выполняются
-только к **Wildberries Content API v2**. Лаунчер (`main.py`) напрямую сетевые
-запросы не выполняет — он лишь читает токены через общий модуль `apps/DBase.py`
-и сохраняет настройки. Модуль `apps/_Full_Update.py` не делает собственных
-HTTP-вызовов: он удаляет файл курсора и запускает `DBase.run()`.
+Все обращения к внешним API в рамках лаунчера и его модулей выполняются к
+**Wildberries Content API v2** и **Ozon Seller API**. Лаунчер (`main.py`)
+напрямую сетевые запросы не выполняет — он лишь читает токены через общий
+модуль `apps/DBase.py` и сохраняет настройки. Модуль `apps/_Full_Update.py`
+не делает собственных HTTP-вызовов: он удаляет файл курсора и запускает
+`DBase.run()`.
 
 ---
 
@@ -55,6 +56,7 @@ Wildberries и защищает от HTTP `429`.
 | Категория | Лимит | burst (max_tokens) | refill_rate |
 |-----------|-------|--------------------|-------------|
 | `CONTENT` | 100 запросов/мин (~600 мс) | 5 | 100 / 60 |
+| `OZ` | базовый безопасный лимит | 2 | 2.0 |
 
 Дополнительно в `apps/DBase.py` реализованы ретраи: при сетевой ошибке или
 HTTP `429` запрос повторяется до 3 раз с паузой 5 секунд.
@@ -267,6 +269,309 @@ Content-Type: application/json
 
 ---
 
+## Методы Ozon Seller API
+
+Базовый URL: `https://api-seller.ozon.ru`. Используются модулем `apps/DBase.py`
+при синхронизации таблиц Ozon (`oz_products`, `oz_archive`, `oz_product_values`,
+`oz_charcs`). Если в `.env` не заполнены `OZ_MASTER_TOKEN` и `OZON_CLIENT_ID`,
+этап Ozon пропускается.
+
+### Аутентификация Ozon
+
+В отличие от Wildberries, Ozon требует два заголовка:
+
+```http
+Client-Id: {OZON_CLIENT_ID}
+Api-Key: {OZ_MASTER_TOKEN}
+Content-Type: application/json
+```
+
+Токен читается через `get_oz_token("MASTER")`, Client-Id — через
+`get_oz_client_id()`. Перед каждым запросом вызывается
+`DBase.LIMITER.wait_for_token("OZ")`.
+
+---
+
+### 4. Список товаров
+
+Возвращает список товаров продавца с пагинацией по `last_id`.
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v3/product/list` |
+| Модуль | `apps/DBase.py` |
+| Таймаут | 60 с |
+
+**Заголовки**
+
+```http
+Client-Id: {OZON_CLIENT_ID}
+Api-Key: {OZ_MASTER_TOKEN}
+Content-Type: application/json
+```
+
+**Тело запроса**
+
+```json
+{
+  "filter": { "visibility": "ALL" },
+  "last_id": "",
+  "limit": 100
+}
+```
+
+**Описание полей тела запроса**
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|--------------|----------|
+| `filter.visibility` | `string` | да | Фильтр видимости. `ALL` — все товары. |
+| `last_id` | `string` | нет | Курсор следующей страницы (пустая строка для первой). |
+| `limit` | `int` | да | Размер страницы (`OZ_PAGE_SIZE` = 100). |
+
+**Структура ответа**
+
+```json
+{
+  "result": {
+    "items": [
+      { "product_id": 123456789, "offer_id": "ART-SUP" }
+    ],
+    "total": 100,
+    "last_id": "..."
+  }
+}
+```
+
+Пагинация: модуль повторяет запрос с `last_id` из предыдущего ответа, пока
+`last_id` не станет пустым.
+
+---
+
+### 5. Детали товаров (список)
+
+Возвращает детали товаров батчем по списку `product_id`.
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v3/product/info/list` |
+| Модуль | `apps/DBase.py` |
+| Таймаут | 60 с |
+
+**Заголовки**
+
+```http
+Client-Id: {OZON_CLIENT_ID}
+Api-Key: {OZ_MASTER_TOKEN}
+Content-Type: application/json
+```
+
+**Тело запроса**
+
+```json
+{
+  "product_id": [123456789, 987654321]
+}
+```
+
+**Описание полей тела запроса**
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|--------------|----------|
+| `product_id` | `int[]` | да | Список ID товаров. Модуль отправляет батчами до 1000 (`OZ_INFO_BATCH_SIZE`). |
+
+**Структура ответа (ключевые поля)**
+
+Ответ приходит сразу на верхнем уровне (`items`, без обёртки `result`):
+
+```json
+{
+  "items": [
+    {
+      "id": 123456789,
+      "offer_id": "ART-SUP",
+      "name": "Название",
+      "is_archived": false,
+      "is_autoarchived": false,
+      "barcodes": ["9785000000000"],
+      "description_category_id": 200001485,
+      "type_id": 971445087,
+      "created_at": "2023-03-23T09:38:59Z",
+      "updated_at": "2025-10-07T12:21:42Z",
+      "images": ["https://..."],
+      "currency_code": "RUB",
+      "min_price": "290.00",
+      "old_price": "500.00",
+      "price": "300.00",
+      "vat": "0.00",
+      "volume_weight": 0.2,
+      "sources": [ { "sku": 905654295, "source": "fbo" } ],
+      "stocks": { "fbo": 5 },
+      "statuses": { "imported": true },
+      "sku": 905654295
+    }
+  ]
+}
+```
+
+Обработка полей модулем `DBase`:
+
+- `id` → колонка `product_id`; `barcodes` → колонка `barcode` (склейка); `images` → колонка `images` (JSON).
+- `is_archived` определяет разделение: `true` → `oz_archive`, иначе → `oz_products`.
+- Остальные скалярные поля (строки/числа/булевы) → колонки `oz_products`/`oz_archive` (неизвестные создаются автоматически).
+- Вложенные списки/объекты (`sources`, `commissions`, `stocks`, `statuses`, `visibility_details`, `price_indexes`, `promotions`, `availabilities` и т.п.) → `oz_product_values` (`field_name` = имя поля, `value` = JSON).
+- `description_category_id` + `type_id` накапливаются для запроса справочника атрибутов.
+
+---
+
+### 6. Справочник атрибутов категории
+
+Возвращает список атрибутов для категории.
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v1/description-category/attribute` |
+| Модуль | `apps/DBase.py` |
+| Таймаут | 60 с |
+
+**Заголовки**
+
+```http
+Client-Id: {OZON_CLIENT_ID}
+Api-Key: {OZ_MASTER_TOKEN}
+Content-Type: application/json
+```
+
+**Тело запроса**
+
+```json
+{
+  "description_category_id": 17028922,
+  "type_id": 123,
+  "language": "RU"
+}
+```
+
+**Описание полей тела запроса**
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|--------------|----------|
+| `description_category_id` | `int` | да | ID категории описания. |
+| `type_id` | `int` | да | ID типа товара. |
+| `language` | `string` | да | Язык значений (`RU`). |
+
+**Структура ответа**
+
+```json
+{
+  "result": [
+    {
+      "id": 85,
+      "name": "Цвет",
+      "description": "Цвет товара",
+      "type": "String",
+      "is_collection": false,
+      "is_required": true,
+      "dictionary_id": 123
+    }
+  ]
+}
+```
+
+Модуль записывает эти данные в `oz_charcs` (`attribute_id`, `name`,
+`description`, `is_required`, `is_collection`, `data_type`, `dictionary_id`).
+
+---
+
+### 7. Характеристики товаров
+
+Возвращает характеристики (`attributes`) и габариты товаров. В отличие от
+`product/info/list`, который не содержит атрибутов, этот метод отдаёт их
+вместе с размерами упаковки.
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v4/product/info/attributes` |
+| Модуль | `apps/DBase.py` |
+| Таймаут | 60 с |
+
+**Заголовки**
+
+```http
+Client-Id: {OZON_CLIENT_ID}
+Api-Key: {OZ_MASTER_TOKEN}
+Content-Type: application/json
+```
+
+**Тело запроса**
+
+```json
+{
+  "filter": {
+    "product_id": ["123456789"],
+    "offer_id": [],
+    "sku": [],
+    "visibility": "ALL"
+  },
+  "last_id": "",
+  "limit": 1000,
+  "sort_by": "id",
+  "sort_dir": "ASC"
+}
+```
+
+**Описание полей тела запроса**
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|--------------|----------|
+| `filter.product_id` | `string[]` | нет | Поиск по `product_id` (значения — строки). |
+| `filter.offer_id` | `string[]` | нет | Поиск по артикулу продавца. |
+| `filter.sku` | `string[]` | нет | Поиск по SKU Ozon. |
+| `filter.visibility` | `string` | да | Фильтр видимости (`ALL`). |
+| `last_id` | `string` | нет | Курсор следующей страницы. |
+| `limit` | `int` | да | Размер страницы (1–1000). |
+| `sort_by` / `sort_dir` | `string` | нет | Поле и направление сортировки. |
+
+**Структура ответа (ключевые поля)**
+
+```json
+{
+  "result": [
+    {
+      "id": 213761435,
+      "offer_id": "21470",
+      "name": "Плёнка защитная",
+      "barcode": "",
+      "barcodes": ["123124123"],
+      "type_id": 124572394,
+      "description_category_id": 71107562,
+      "height": 10, "depth": 210, "width": 140, "dimension_unit": "mm",
+      "weight": 50, "weight_unit": "g",
+      "images": ["https://..."],
+      "attributes": [
+        { "id": 85, "complex_id": 0, "values": [ { "dictionary_value_id": 971034861, "value": "Brand" } ] }
+      ],
+      "attributes_with_defaults": [5435, 3452],
+      "complex_attributes": []
+    }
+  ],
+  "total": 1,
+  "last_id": "onVsfA=="
+}
+```
+
+Обработка полей модулем `DBase`:
+
+- `attributes[].id` + `values[].value` → `oz_product_values` (`attribute_id`, `value`).
+- `complex_attributes` и `attributes_with_defaults` → `oz_product_values` (по `field_name`, JSON).
+- габариты (`height`, `depth`, `width`, `weight`, `dimension_unit`, `weight_unit`) → колонки `oz_products`.
+- пагинация — по `last_id`, пока он не станет пустым.
+
+---
+
 ## Сводная таблица эндпоинтов
 
 | Метод | Endpoint | Модуль | Назначение |
@@ -274,4 +579,8 @@ Content-Type: application/json
 | `POST` | `/content/v2/get/cards/list` | `apps/DBase.py` | Выгрузка списка карточек товаров (курсорная пагинация). |
 | `GET` | `/content/v2/object/charcs/{subjectId}` | `apps/DBase.py` | Справочник характеристик категории товаров. |
 | `POST` | `/content/v2/cards/moveNm` | `apps/Stack.py` | Объединение/разъединение карточек товаров (управление группами). |
+| `POST` | `/v3/product/list` | `apps/DBase.py` | Список товаров Ozon (пагинация `last_id`). |
+| `POST` | `/v3/product/info/list` | `apps/DBase.py` | Детали товаров Ozon батчами по `product_id`. |
+| `POST` | `/v4/product/info/attributes` | `apps/DBase.py` | Характеристики и габариты товаров Ozon (пагинация `last_id`). |
+| `POST` | `/v1/description-category/attribute` | `apps/DBase.py` | Справочник атрибутов категории Ozon. |
 
