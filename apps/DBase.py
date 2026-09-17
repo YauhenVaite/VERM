@@ -111,6 +111,16 @@ ENV_PARAM_LABELS = [
     ("WB_WAREHOUSE_ID", "ID складов Wildberries (массив)"),
     ("OZON_WAREHOUSE_ID", "ID складов Ozon (массив)"),
     ("OZON_CLIENT_ID", "Client-Id Ozon"),
+    ("TELEGRAM_BOT_TOKEN", "Токен Telegram-бота"),
+    ("YOUR_TELEGRAM_ID", "Telegram ID владельца"),
+    ("TELEGRAM_GROUP_ID", "Telegram ID группы уведомлений"),
+    ("TELEGRAM_ORDERS_GROUP_ID", "Telegram ID группы заказов"),
+    ("TELEGRAM_CANCELS_GROUP_ID", "Telegram ID группы отмен"),
+    ("OZON_ENABLED", "Обработка Ozon (true/false)"),
+    ("NOTIFICATIONS_ENABLED", "Уведомления (true/false)"),
+    ("WB_CHECK_INTERVAL", "Интервал проверки WB (мин)"),
+    ("OZON_DELAY_AFTER_WB", "Пауза перед Ozon после WB (сек)"),
+    ("ORDERS_HISTORY_DAYS", "Дней хранения истории заказов"),
 ]
 
 
@@ -523,6 +533,47 @@ def _create_tables(connection: sqlite3.Connection) -> None:
         """
     )
 
+    # Заказы Wildberries: активные и история в одной таблице.
+    # Локальные флаги (notified_*/is_active/saw_sorted) управляют дедупликацией
+    # уведомлений; сырые статусы supplier_status/wb_status пишутся как есть.
+    # Неизвестные скалярные поля ответа добавляются колонками автоматически.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS wb_orders (
+            id INTEGER PRIMARY KEY,
+            article TEXT,
+            nmId INTEGER,
+            chrtId INTEGER,
+            supplier_status TEXT,
+            wb_status TEXT,
+            is_cancellable INTEGER,
+            saw_sorted INTEGER DEFAULT 0,
+            notified_new INTEGER DEFAULT 0,
+            notified_cancel INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            first_seen_at TEXT,
+            last_seen_at TEXT,
+            history_at TEXT
+        )
+        """
+    )
+
+    # Заказы Ozon (FBS-отправления).
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS oz_orders (
+            posting_number TEXT PRIMARY KEY,
+            offer_id TEXT,
+            status TEXT,
+            notified_new INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            first_seen_at TEXT,
+            last_seen_at TEXT,
+            history_at TEXT
+        )
+        """
+    )
+
     connection.commit()
 
 
@@ -828,6 +879,8 @@ class WBRateLimiter:
         "PRICES": {"max_tokens": 3, "refill_rate": 3.0},
         # 5 запросов/сек (~200 мс), burst = 5.
         "STOCKS": {"max_tokens": 5, "refill_rate": 5.0},
+        # Сборочные задания/поставки WB: 300 запр/мин (5/сек), всплеск 20.
+        "WB_ORDERS": {"max_tokens": 20, "refill_rate": 5.0},
         # Базовый безопасный лимит для остальных категорий.
         "MARKETPLACE": {"max_tokens": 2, "refill_rate": 2.0},
         "STATISTICS": {"max_tokens": 2, "refill_rate": 2.0},
@@ -1847,6 +1900,159 @@ def _sync_oz(connection):
         _logger.info("Ozon: синхронизация завершена (%s).", counters)
     finally:
         session.close()
+# ---------------------------------------------------------------------------
+# Заказы Wildberries и Ozon (таблицы заполняет бот-демон)
+# ---------------------------------------------------------------------------
+_ORDER_TABLES = frozenset({"wb_orders", "oz_orders"})
+
+
+def ensure_order_columns(db_cursor, table, values: dict) -> list:
+    """Создаёт в таблице заказов недостающие колонки под новые скалярные поля.
+
+    Вложенные структуры (dict/list) должны быть уже сериализованы в JSON-строки.
+    Возвращает список созданных колонок.
+    """
+    if table not in _ORDER_TABLES:
+        raise ValueError(f"Неизвестная таблица заказов: {table}")
+    existing = {row[1] for row in db_cursor.execute(f"PRAGMA table_info({table})")}
+    created = []
+    for name, value in values.items():
+        if name in existing or not SQL_IDENTIFIER_RE.match(name):
+            continue
+        db_cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {_infer_sql_type(value)}")
+        existing.add(name)
+        created.append(name)
+    return created
+
+
+def upsert_order(db_cursor, table, key_column, key_value, fields: dict) -> str:
+    """Вставляет или обновляет строку заказа.
+
+    Новые скалярные поля автоматически создают колонки, вложенные структуры
+    сериализуются в JSON. Возвращает 'insert' или 'update'.
+    """
+    if table not in _ORDER_TABLES:
+        raise ValueError(f"Неизвестная таблица заказов: {table}")
+
+    normalized = {}
+    for name, value in fields.items():
+        if isinstance(value, (dict, list)):
+            normalized[name] = _json_dumps(value)
+        elif isinstance(value, bool):
+            normalized[name] = 1 if value else 0
+        elif value is not None:
+            normalized[name] = value
+
+    ensure_order_columns(db_cursor, table, normalized)
+
+    columns = list(normalized.keys())
+    values = [normalized[col] for col in columns]
+
+    existing = db_cursor.execute(
+        f"SELECT 1 FROM {table} WHERE {key_column} = ?", (key_value,)
+    ).fetchone()
+
+    if existing is None:
+        cols = [key_column] + columns
+        placeholders = ", ".join(["?"] * len(cols))
+        db_cursor.execute(
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
+            [key_value] + values,
+        )
+        return "insert"
+
+    assignments = ", ".join(f"{col} = ?" for col in columns)
+    db_cursor.execute(
+        f"UPDATE {table} SET {assignments} WHERE {key_column} = ?",
+        values + [key_value],
+    )
+    return "update"
+
+
+def refresh_wb_cards() -> bool:
+    """Инкрементально обновляет каталог Wildberries по сохранённому курсору.
+
+    Вызывается ботом-демоном при обнаружении неизвестного артикула в заказе,
+    чтобы не перекачивать весь каталог заново (как это делает run()).
+    Возвращает True при успехе, иначе False.
+    """
+    api_key = _load_api_key()
+    if api_key is None:
+        _logger.error("refresh_wb_cards: нет токена CONTENT/MASTER.")
+        return False
+
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": api_key,
+        "Content-Type": "application/json",
+    })
+
+    connection = sqlite3.connect(DB_PATH)
+    counters = {
+        "cards": 0,
+        "products_inserted": 0,
+        "products_updated": 0,
+        "values_inserted": 0,
+        "values_updated": 0,
+    }
+    try:
+        _create_tables(connection)
+        _migrate_product_columns(connection)
+        _migrate_charcs_columns(connection)
+        _migrate_product_values_columns(connection)
+        _drop_obsolete_product_columns(connection)
+        _create_unique_indexes(connection)
+        _seed_charcs(connection)
+
+        categories = {}
+        db_cursor = connection.cursor()
+        cursor_state = _load_cursor() or {"limit": CARDS_PAGE_SIZE}
+
+        while True:
+            data, cursor_state = _fetch_cards_page(session, cursor_state)
+            cards = data.get("cards") or []
+            if not cards:
+                break
+            for card in cards:
+                counters["cards"] += 1
+                result = _process_card(db_cursor, card, categories, counters)
+                if result == "insert":
+                    counters["products_inserted"] += 1
+                elif result == "update":
+                    counters["products_updated"] += 1
+            connection.commit()
+
+            cursor_meta = data.get("cursor") or {}
+            _save_cursor(cursor_meta)
+
+            total = cursor_meta.get("total")
+            if total is not None and total < CARDS_PAGE_SIZE:
+                break
+            next_updated = cursor_meta.get("updatedAt")
+            next_nm = cursor_meta.get("nmID")
+            if not next_updated and not next_nm:
+                break
+            if (
+                next_updated == cursor_state.get("updatedAt")
+                and next_nm == cursor_state.get("nmID")
+            ):
+                break
+            cursor_state = {
+                "updatedAt": next_updated,
+                "nmID": next_nm,
+                "limit": CARDS_PAGE_SIZE,
+            }
+
+        _logger.info("Инкрементальное обновление карточек: %s", counters)
+        return True
+    except requests.RequestException as exc:
+        _logger.error("Инкрементальное обновление карточек не удалось: %s", exc)
+        return False
+    finally:
+        session.close()
+        connection.close()
+
+
 def run() -> None:
     """Главная функция модуля. Вызывается лаунчером в отдельном потоке."""
     _configure_logging()

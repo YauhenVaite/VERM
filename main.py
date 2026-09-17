@@ -15,6 +15,7 @@ import json
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 import customtkinter as ctk
@@ -26,6 +27,11 @@ BASE_DIR = Path(__file__).resolve().parent
 APPS_DIR = BASE_DIR / "apps"
 DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = DATA_DIR / "config.json"
+BOT_STATUS_PATH = DATA_DIR / "bot_status.json"
+BOT_LOG_DIR = DATA_DIR / "logs"
+
+# Максимум строк, отображаемых в консоли логов (защита от разрастания GUI).
+MAX_CONSOLE_LINES = 10000
 
 # Служебные папки создаём автоматически, чтобы проект сразу был готов к работе.
 APPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -135,6 +141,12 @@ class LauncherApp(ctk.CTk):
         self._settings_window = None
         self._dbase_settings_button = None
         self._dbase_refresh_button = None
+        self._bot_status_dot = None
+        self._bot_console_button = None
+        self._bot_console_window = None
+        self._bot_console_textbox = None
+        self._bot_console_offset = 0
+        self._bot_console_files_read: set[str] = set()
 
         self._build_ui()
         self._refresh_modules()
@@ -144,6 +156,9 @@ class LauncherApp(ctk.CTk):
 
         # Автозапуск DBase (если включён) и цикличный таймер перезапуска.
         self._setup_dbase_scheduler()
+
+        # Индикатор состояния демона бота (зелёный/красный кружок).
+        self.after(1000, self._poll_bot_status)
 
     # --------------------------- Построение UI ---------------------------
     def _build_ui(self) -> None:
@@ -213,6 +228,7 @@ class LauncherApp(ctk.CTk):
         self._module_buttons.clear()
         self._dbase_settings_button = None
         self._dbase_refresh_button = None
+        self._bot_console_button = None
 
         if not self._modules:
             ctk.CTkLabel(
@@ -269,6 +285,31 @@ class LauncherApp(ctk.CTk):
                 settings_button.pack(side="left", padx=(8, 0))
                 settings_button.configure(command=self._open_settings)
                 self._dbase_settings_button = settings_button
+
+            # Для модуля Bot — индикатор состояния демона (зелёный/красный кружок)
+            # и кнопка консоли логов (🖥) справа от индикатора.
+            if module_path.stem == "Bot":
+                console_button = ctk.CTkButton(
+                    row,
+                    text="🖥",
+                    width=48,
+                    height=48,
+                    corner_radius=10,
+                    font=ctk.CTkFont(size=16),
+                )
+                console_button.pack(side="right", padx=(8, 6))
+                console_button.configure(command=self._toggle_bot_console)
+                self._bot_console_button = console_button
+
+                dot = ctk.CTkLabel(
+                    row,
+                    text="●",
+                    width=24,
+                    font=ctk.CTkFont(size=20),
+                    text_color="#e74c3c",
+                )
+                dot.pack(side="right", padx=(8, 0))
+                self._bot_status_dot = dot
 
         self._set_status(f"Найдено модулей: {len(self._modules)}")
 
@@ -383,8 +424,169 @@ class LauncherApp(ctk.CTk):
                 button.configure(state="normal")
             self._set_status(status)
 
+    # ------------------- Индикатор состояния демона бота -------------------
+    def _poll_bot_status(self) -> None:
+        """Периодически обновляет цвет индикатора бота по data/bot_status.json."""
+        color = "#e74c3c"  # красный: не запущен
+        try:
+            if BOT_STATUS_PATH.exists():
+                with BOT_STATUS_PATH.open("r", encoding="utf-8") as file:
+                    data = json.load(file)
+                state = data.get("state", "")
+                heartbeat = data.get("last_heartbeat", 0)
+                if state in ("running", "starting"):
+                    if time.time() - float(heartbeat) < 15:
+                        color = "#2ecc71"  # зелёный: работает
+                    else:
+                        color = "#f1c40f"  # жёлтый: запускается/нет heartbeat
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+        if self._bot_status_dot is not None:
+            self._bot_status_dot.configure(text_color=color)
+        self.after(1000, self._poll_bot_status)
+
     def _set_status(self, text: str) -> None:
         self.status.configure(text=text)
+
+    # ------------------------ Консоль логов бота ------------------------
+    def _toggle_bot_console(self) -> None:
+        """Переключает окно консоли логов бота (открыть/скрыть)."""
+        if (
+            self._bot_console_window is not None
+            and self._bot_console_window.winfo_exists()
+        ):
+            self._close_bot_console()
+        else:
+            self._open_bot_console()
+
+    def _open_bot_console(self) -> None:
+        """Открывает отдельное окно с логами бота и запускает их обновление."""
+        window = ctk.CTkToplevel(self)
+        window.title("Консоль бота — логи")
+        window.geometry("780x480")
+        window.minsize(480, 320)
+
+        header = ctk.CTkFrame(window, corner_radius=0, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(12, 6))
+        ctk.CTkLabel(
+            header,
+            text="Логи бота (реальное время)",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        ).pack(side="left")
+        ctk.CTkButton(
+            header,
+            text="Очистить",
+            width=90,
+            command=self._clear_bot_console,
+        ).pack(side="right")
+
+        self._bot_console_textbox = ctk.CTkTextbox(
+            window,
+            wrap="none",
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        self._bot_console_textbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self._bot_console_textbox.configure(state="disabled")
+
+        self._bot_console_window = window
+        # При открытии показываем все имеющиеся логи, затем ведём «хвост».
+        self._bot_console_offset = 0
+        self._bot_console_files_read = set()
+
+        window.protocol("WM_DELETE_WINDOW", self._close_bot_console)
+        self._poll_bot_console()
+
+    def _close_bot_console(self) -> None:
+        """Закрывает окно консоли и прекращает опрос логов."""
+        if self._bot_console_window is not None:
+            try:
+                self._bot_console_window.destroy()
+            except Exception:  # noqa: BLE001 — окно могло быть уже закрыто
+                pass
+        self._bot_console_window = None
+        self._bot_console_textbox = None
+
+    def _clear_bot_console(self) -> None:
+        """Очищает видимый текст консоли (поток логов продолжается)."""
+        if self._bot_console_textbox is not None:
+            self._bot_console_textbox.configure(state="normal")
+            self._bot_console_textbox.delete("1.0", "end")
+            self._bot_console_textbox.configure(state="disabled")
+
+    def _poll_bot_console(self) -> None:
+        """Периодически читает новые строки логов и добавляет их в консоль."""
+        if (
+            self._bot_console_window is None
+            or not self._bot_console_window.winfo_exists()
+        ):
+            return
+
+        new_lines = self._read_new_bot_log_lines()
+        if new_lines:
+            self._append_bot_log_lines(new_lines)
+
+        self.after(1000, self._poll_bot_console)
+
+    def _read_new_bot_log_lines(self) -> list[str]:
+        """Возвращает новые строки логов бота.
+
+        Ротированные файлы `bot.log.*` читаются целиком один раз каждый,
+        а текущий `bot.log` — только новая часть (по байтовому смещению).
+        """
+        lines: list[str] = []
+        if not BOT_LOG_DIR.exists():
+            return lines
+
+        current = BOT_LOG_DIR / "bot.log"
+
+        # 1) Ротированные файлы bot.log.* — читаем целиком один раз каждый.
+        for path in sorted(BOT_LOG_DIR.glob("bot.log.*"), key=lambda p: p.name):
+            if path.name in self._bot_console_files_read:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            self._bot_console_files_read.add(path.name)
+            if text:
+                lines.extend(text.splitlines())
+
+        # 2) Текущий файл bot.log — читаем только новую часть.
+        if current.exists():
+            try:
+                size = current.stat().st_size
+            except OSError:
+                size = -1
+            if size < self._bot_console_offset:
+                # Файл пересоздан после ротации — начинаем читать заново.
+                self._bot_console_offset = 0
+            if size > self._bot_console_offset:
+                try:
+                    with current.open("rb") as file:
+                        file.seek(self._bot_console_offset)
+                        raw = file.read()
+                    self._bot_console_offset = size
+                except OSError:
+                    return lines
+                if raw:
+                    lines.extend(raw.decode("utf-8", errors="replace").splitlines())
+        return lines
+
+    def _append_bot_log_lines(self, lines: list[str]) -> None:
+        """Добавляет строки в текстовое поле консоли и прокручивает вниз."""
+        box = self._bot_console_textbox
+        if box is None or not lines:
+            return
+        box.configure(state="normal")
+        box.insert("end", "\n".join(lines) + "\n")
+
+        # Ограничиваем объём текста, чтобы окно не «тормозило».
+        line_count = int(box.index("end-1c").split(".")[0])
+        if line_count > MAX_CONSOLE_LINES:
+            box.delete("1.0", f"{line_count - MAX_CONSOLE_LINES}.0")
+
+        box.see("end")
+        box.configure(state="disabled")
 
     # -------------------- Автозапуск и таймер DBase ---------------------
     def _setup_dbase_scheduler(self) -> None:

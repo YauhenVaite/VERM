@@ -3,7 +3,7 @@
 Документация по всем HTTP-методам, эндпоинтам и телам запросов, которые
 используются лаунчером (`main.py`) и его модулями из папки `apps/`.
 
-> Папка `BOT/` в этой документации не учитывается.
+> Бот интегрирован как модуль `apps/Bot.py` + демон `apps/_BotDaemon.py`; его эндпоинты описаны в отдельных разделах ниже.
 
 Все обращения к внешним API в рамках лаунчера и его модулей выполняются к
 **Wildberries Content API v2** и **Ozon Seller API**. Лаунчер (`main.py`)
@@ -572,6 +572,214 @@ Content-Type: application/json
 
 ---
 
+## Методы Wildberries Marketplace API v3 (бот)
+
+Используются демоном `apps/_BotDaemon.py` (запускается модулем `apps/Bot.py`).
+Базовый URL: `https://marketplace-api.wildberries.ru`, авторизация — заголовок
+`Authorization: {токен}` (мастер-токен WB, `get_wb_token("MASTER")`).
+Лимиты сборочных заданий: 300 запр/мин (интервал 200 мс, всплеск 20);
+**запрос с кодом 4XX учитывается как 10 запросов**, поэтому демон не ретраит
+4xx и открывает circuit breaker.
+
+### 1. Список новых заказов
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `GET` |
+| URL | `https://marketplace-api.wildberries.ru/api/v3/orders/new` |
+| Модуль | `apps/_BotDaemon.py` |
+| Таймаут | 60 с |
+
+Заголовок: `Authorization: {токен}`. Тела запроса нет. Ответ — `{ "orders": [...] }`.
+
+### 2. Статусы сборочных заданий
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://marketplace-api.wildberries.ru/api/v3/orders/status` |
+| Модуль | `apps/_BotDaemon.py` |
+
+**Тело запроса**
+
+```json
+{ "orders": [5632423] }
+```
+
+`orders` — массив ID сборочных заданий (до 1000).
+
+**Ответ**
+
+```json
+{
+  "orders": [
+    { "id": 5632423, "isCancellable": false, "supplierStatus": "new", "wbStatus": "waiting" }
+  ]
+}
+```
+
+`supplierStatus`: `new`, `confirm`, `complete`, `cancel`, `cancel_carrier`.
+`wbStatus`: `waiting`, `sorted`, `sold`, `canceled`, `canceled_by_client`,
+`declined_by_client`, `defect`, `ready_for_pickup`, `accepted_by_carrier`,
+`sent_to_carrier`, `canceled_by_carrier`.
+
+### 3. Заказы за период (сверка отмен)
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `GET` |
+| URL | `https://marketplace-api.wildberries.ru/api/v3/orders?limit=1000&next={next}&dateFrom={unix}&dateTo={unix}` |
+| Модуль | `apps/_BotDaemon.py` |
+
+Используется для сверки отмен за период (`dateFrom`/`dateTo` в Unix-time) с курсорной пагинацией через `next`. Ответ — `{ "orders": [...], "next": 0 }`, где каждый заказ содержит `id`, `article` (vendorCode), `nmId`, `chrtId`. Так ловятся отмены, случившиеся пока бот был выключен.
+
+> **Важно:** этот эндпоинт **не возвращает** `supplierStatus` и `wbStatus`.
+> Поэтому после получения списка заказов демон дозапрашивает статусы через
+> `POST /api/v3/orders/status` батчами до 1000 `id` (см. раздел 2) и по ним
+> определяет, является ли заказ отменой (`cancel_message`).
+
+### 4. Остатки товаров (получение/обновление)
+
+| Характеристика | Значение |
+|----------------|----------|
+| URL | `https://marketplace-api.wildberries.ru/api/v3/stocks/{warehouseId}` |
+| Модуль | `apps/_BotDaemon.py` |
+
+- Получение остатков — `POST` с телом `{ "chrtIds": [123] }`.
+- Обновление остатков — `PUT` с телом `{ "stocks": [{ "chrtId": 123, "amount": 5 }] }`.
+
+---
+
+## Методы Ozon Seller API (бот)
+
+Используются демоном `apps/_BotDaemon.py`. Базовый URL:
+`https://api-seller.ozon.ru`, заголовки `Client-Id` и `Api-Key`.
+
+### 1. Невыполненные FBS-отправления
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v4/posting/fbs/unfulfilled/list` |
+| Модуль | `apps/_BotDaemon.py` |
+
+**Тело запроса**
+
+```json
+{
+  "sort_dir": "ASC",
+  "limit": 100,
+  "filter": {
+    "cutoff_from": "2026-08-19T12:01:00.000Z",
+    "cutoff_to": "2026-10-18T12:01:00.000Z",
+    "statuses": ["awaiting_packaging"]
+  },
+  "cursor": "",
+  "with": {
+    "analytics_data": false,
+    "barcodes": false,
+    "financial_data": false,
+    "legal_info": false
+  }
+}
+```
+
+`filter` использует фильтр по времени сборки через `cutoff_from`/`cutoff_to`
+(альтернатива — `delivering_date_from`/`delivering_date_to`; использовать обе
+пары сразу нельзя). Демон задаёт окно ±30 дней от завтрашнего дня 12:01.
+`limit` ограничен диапазоном (0, 100]; выгрузка идёт постранично через `cursor`,
+пока в ответе `has_next` == true.
+
+Ответ — объект с массивом отправлений (поле `postings`) и флагами `has_next` /
+`cursor` для следующей страницы. Каждое отправление содержит `posting_number`,
+`status` и `products` (список объектов с `offer_id`, `name`, `quantity`, `sku`).
+
+### 2. Обновление остатков
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v2/products/stocks` |
+| Модуль | `apps/_BotDaemon.py` |
+
+**Тело запроса**
+
+```json
+{
+  "stocks": [
+    { "offer_id": "9785001957812", "stock": 5, "warehouse_id": 1020005000394863 }
+  ]
+}
+```
+
+Обновление отправляется **только для товаров, найденных в `oz_products`**
+(жёсткая связка `WB article == Ozon offer_id`).
+
+### 3. Информация об остатках (получение)
+
+| Характеристика | Значение |
+|----------------|----------|
+| Метод | `POST` |
+| URL | `https://api-seller.ozon.ru/v4/product/info/stocks` |
+| Модуль | `apps/_BotDaemon.py` |
+
+**Тело запроса**
+
+```json
+{
+  "cursor": "",
+  "filter": {
+    "offer_id": ["9785001957812"],
+    "visibility": "ALL"
+  },
+  "limit": 1000
+}
+```
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|--------------|----------|
+| `cursor` | `string` | нет | Курсор пагинации (пустая строка для первой страницы). |
+| `filter.offer_id` | `string[]` | нет | Список `offer_id` (артикулов) для запроса остатков. |
+| `filter.visibility` | `string` | да | Видимость товара (`ALL`). |
+| `limit` | `int` | нет | Размер страницы (до 1000). |
+
+**Структура ответа**
+
+```json
+{
+  "items": [
+    {
+      "offer_id": "9785001957812",
+      "product_id": 1000123456,
+      "stocks": [
+        { "sku": 1000123456, "type": "fbs", "present": 150, "reserved": 25 },
+        { "sku": 1000123456, "type": "fbo", "present": 75, "reserved": 10 }
+      ]
+    }
+  ],
+  "cursor": "next-cursor-12345",
+  "total": 1
+}
+```
+
+Бот берёт запись `stocks[]` с `type == "fbs"` и считает доступный остаток как
+`present - reserved`. Результат используется в уведомлении о новом заказе Ozon
+(«Остаток: Oz - …шт, Wb - …шт»).
+
+---
+
+## Telegram Bot API (бот)
+
+Базовый URL: `https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}`.
+
+| Метод | Endpoint | Назначение |
+|-------|----------|------------|
+| `GET` | `/getUpdates` | Получение обновлений (long polling; команды `/status`, `/stop`). |
+| `POST` | `/sendMessage` | Текстовые уведомления (HTML, `<code>`). |
+| `POST` | `/sendPhoto` | Фото товара с подписью (multipart/form-data). |
+
+---
+
 ## Сводная таблица эндпоинтов
 
 | Метод | Endpoint | Модуль | Назначение |
@@ -583,4 +791,14 @@ Content-Type: application/json
 | `POST` | `/v3/product/info/list` | `apps/DBase.py` | Детали товаров Ozon батчами по `product_id`. |
 | `POST` | `/v4/product/info/attributes` | `apps/DBase.py` | Характеристики и габариты товаров Ozon (пагинация `last_id`). |
 | `POST` | `/v1/description-category/attribute` | `apps/DBase.py` | Справочник атрибутов категории Ozon. |
+| `GET` | `/api/v3/orders/new` | `apps/_BotDaemon.py` | Список новых заказов WB. |
+| `POST` | `/api/v3/orders/status` | `apps/_BotDaemon.py` | Статусы сборочных заданий WB по ID. |
+| `GET` | `/api/v3/orders` | `apps/_BotDaemon.py` | Сверка отмен за период (reconciliation). |
+| `POST`/`PUT` | `/api/v3/stocks/{warehouseId}` | `apps/_BotDaemon.py` | Получение/обновление остатков WB. |
+| `POST` | `/v4/posting/fbs/unfulfilled/list` | `apps/_BotDaemon.py` | Невыполненные FBS-отправления Ozon. |
+| `POST` | `/v2/products/stocks` | `apps/_BotDaemon.py` | Обновление остатков Ozon. |
+| `POST` | `/v4/product/info/stocks` | `apps/_BotDaemon.py` | Получение остатков Ozon. |
+| `GET` | `/getUpdates` | `apps/_BotDaemon.py` | Telegram long polling. |
+| `POST` | `/sendMessage` | `apps/_BotDaemon.py` | Telegram: текстовое уведомление. |
+| `POST` | `/sendPhoto` | `apps/_BotDaemon.py` | Telegram: фото товара. |
 
