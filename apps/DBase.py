@@ -49,6 +49,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "inventory.db")
 ENV_PATH = os.path.join(BASE_DIR, ".env")
+# Метка времени последнего успешного обновления БД. Используется лаунчером,
+# чтобы не запускать DBase повторно, если он недавно уже обновлялся (например,
+# после создания карточки в Cards Creator).
+LAST_UPDATE_PATH = os.path.join(DATA_DIR, "dbase_last_update.json")
 
 # ---------------------------------------------------------------------------
 # Секреты (.env). Файл создаётся автоматически, если его нет.
@@ -116,11 +120,13 @@ ENV_PARAM_LABELS = [
     ("TELEGRAM_GROUP_ID", "Telegram ID группы уведомлений"),
     ("TELEGRAM_ORDERS_GROUP_ID", "Telegram ID группы заказов"),
     ("TELEGRAM_CANCELS_GROUP_ID", "Telegram ID группы отмен"),
+    ("TELEGRAM_ORDER_BUTTON_GROUP_ID", "Telegram ID группы для кнопки «Заказать»"),
     ("OZON_ENABLED", "Обработка Ozon (true/false)"),
     ("NOTIFICATIONS_ENABLED", "Уведомления (true/false)"),
     ("WB_CHECK_INTERVAL", "Интервал проверки WB (мин)"),
     ("OZON_DELAY_AFTER_WB", "Пауза перед Ozon после WB (сек)"),
     ("ORDERS_HISTORY_DAYS", "Дней хранения истории заказов"),
+    ("DEEPSEEK_TOKEN", "Токен DeepSeek (распознавание фото)"),
 ]
 
 
@@ -182,6 +188,194 @@ SEED_CHARCS = [
     (90846, "Высота упаковки", "height"),
     (90849, "Длина упаковки", "length"),
     (88952, "Вес с упаковкой", "weightBrutto"),
+]
+
+# ---------------------------------------------------------------------------
+# Промты для DeepSeek (Seed). Каждый кортеж:
+# (code, name, task_type, variant, marketplace, lang, model,
+#  temperature, response_format, prompt_text)
+# ---------------------------------------------------------------------------
+SEED_PROMTS = [
+    (
+        "extract:standard",
+        "Извлечение характеристик",
+        "extract",
+        "standard",
+        "any",
+        "ru",
+        "deepseek-flash",
+        0.0,
+        "json",
+        "Ты — ассистент по атрибуции товаров для маркетплейса. "
+        "Товар относится к категории: «{{category}}». "
+        "Допустимые характеристики этой категории (ищи на фото ТОЛЬКО их):\n"
+        "{{charcs}}\n"
+        "Извлеки из фотографий только те характеристики из списка выше, которые "
+        "реально видны на фото. Имя характеристики пиши точно как в списке. "
+        "Если характеристика из списка не видна на фото — не добавляй её. "
+        "Запрещено выдумывать характеристики или их значения. "
+        "Ответь строго JSON без пояснений в формате: "
+        '{"characteristics": [{"name": "...", "value": "..."}]}',
+    ),
+    (
+        "extract:generator",
+        "Генератор промпта категории (универсальный)",
+        "extract",
+        "generator",
+        "any",
+        "ru",
+        "deepseek-flash",
+        0.0,
+        "json",
+        """Ты — промпт-инженер, который создаёт специализированные системные промпты
+для извлечения характеристик товаров из фотографий (для маркетплейса Wildberries).
+
+ТЕБЕ ДАНЫ:
+1. Категория: «{{category}}» (subjectID = {{subject_id}}).
+2. Общие (паспортные) характеристики — есть у карточек всех категорий:
+{{common_charcs}}
+3. Характеристики, специфичные для этой категории (пометка «обязательная» = критично):
+{{charcs}}
+
+ТВОЯ ЗАДАЧА
+Составь ГОТОВЫЙ системный промпт (текст инструкции для другой LLM), по которому
+та будет извлекать характеристики именно категории «{{category}}» из фотографий
+товара и возвращать чистый JSON для базы данных.
+
+ВАЖНО ПРО ПОЛЕ «Описание» (description):
+Оно НЕ извлекается с фотографии — это творческое описание, которое генерируется
+отдельным промптом с повышенной температурой. Поэтому НЕ включай «Описание» в
+список извлекаемых характеристик и не упоминай его в сгенерированном промпте.
+
+ДЛЯ КАЖДОЙ ХАРАКТЕРИСТИКИ ОПРЕДЕЛИ СПОСОБ ПОЛУЧЕНИЯ ЗНАЧЕНИЯ и пропиши его в
+сгенерированном промпте. Способ может быть одним из трёх:
+1. «ФАКТ» — значение написано прямо на фото (биржа, ярлык, коробка, страница).
+   В промпте пиши: ищи на фото, извлекай буквально, ничего не додумывай; если не
+   видно — не добавляй характеристику.
+2. «СИНОНИМ» — на фото значение есть, но названо иначе (например, у книг вместо
+   «Бренд» на фото указано издательство). В промпте пиши: «если на фото <что
+   искать>, запиши его значение в характеристику „<точное имя>“».
+3. «ВЫВОД» — значение на фото НЕ написано, его надо определить по содержимому и
+   здравому смыслу (например, «Повод подарка», «Кому подарок», «Страна
+   производства» по издательству). В промпте пиши: определи значение по содержимому
+   фото и пометь его как «вывод» (source = "inferred").
+
+СГЕНЕРИРОВАННЫЙ ПРОМПТ ОБЯЗАН:
+1. Начинаться с роли: «Ты — ассистент по атрибуции товаров категории
+   „{{category}}“ для маркетплейса Wildberries.»
+2. Содержать ПОЛНЫЙ перечень характеристик — объедини общие и специфичные — ровно
+   с теми же названиями, что в списках выше. Ничего не добавляй и не убирай (кроме
+   поля «Описание», которое исключается).
+3. Для каждой характеристики указывать способ получения («факт» / «синоним» /
+   «вывод») и короткую подсказку, где и как её искать или определять.
+4. Для «фактов» жёстко запрещать выдумывать значения, которых нет на фото.
+5. Требовать писать имя характеристики ТОЧНО как в перечне (без синонимов, без
+   перефразировок, без изменения регистра).
+6. Требовать добавлять характеристику в ответ ТОЛЬКО если её значение реально
+   определено (видно на фото или обоснованно выведено).
+7. Требовать приводить значения к аккуратному текстовому виду: числа и единицы
+   измерения — как на бирке, без додумывания.
+8. Заканчиваться требованием вернуть СТРОГО JSON без пояснений в формате:
+   {"characteristics": [{"name": "...", "value": "...", "source": "photo"|"inferred"}]}
+   где "source" = "photo" для значений, взятых с фото (факт/синоним), и
+   "inferred" для значений, полученных выводом. Если характеристика не определена —
+   не добавляй её.
+
+Сгенерированный промпт должен быть САМОДОСТАТОЧНЫМ: если подставить его как
+system_prompt, другая модель должна без дополнительных пояснений вернуть
+корректный JSON со списком характеристик.
+
+ОТВЕТЬ СТРОГО JSON без пояснений в формате:
+{
+  "category": "{{category}}",
+  "prompt_text": "<готовый системный промпт целиком>",
+  "characteristics": ["<точное название 1>", "<точное название 2>", "..."]
+}
+где "prompt_text" — готовый системный промпт (одна строка, внутренние кавычки и
+переносы строк должны быть экранированы как в обычной JSON-строке), а
+"characteristics" — точный список названий характеристик в том же порядке, в
+котором они должны искаться.""",
+    ),
+    (
+        "description:standard",
+        "Описание — обычный товар",
+        "description",
+        "standard",
+        "any",
+        "ru",
+        "deepseek-flash",
+        0.7,
+        "text",
+        "Ты — копирайтер, пишущий продающие описания товаров для маркетплейса. "
+        "Ниже — аннотация/исходный текст о товаре:\n"
+        "{{characteristics}}\n\n"
+        "Напиши на его основе живое маркетинговое описание: расскажи, о чём товар "
+        "(для книги — сюжет/суть), чем он цепляет и полезен покупателю.\n"
+        "Требования:\n"
+        "- начни с цепляющего первого предложения;\n"
+        "- эмоционально, вовлекающе, естественно — как человек советует другу;\n"
+        "- строго правдиво: не выдумывай фактов, которых нет в исходном тексте;\n"
+        "- НЕ перечисляй характеристики списком и не дублируй их (автор, бренд, "
+        "ISBN, размеры, вес и т.п. — они уже указаны в карточке отдельно);\n"
+        "- 2-3 ключевых слова вплети органично для SEO;\n"
+        "- объём 300-700 символов.\n"
+        "Ответь только готовым текстом описания, без заголовков и пояснений.",
+    ),
+    (
+        "description:photo",
+        "Описание — по фото (vision)",
+        "description",
+        "photo",
+        "any",
+        "ru",
+        "deepseek-flash",
+        0.5,
+        "text",
+        "Ты — копирайтер, пишущий продающие описания товаров для маркетплейса. "
+        "Посмотри на фотографии товара и напиши на их основе живое маркетинговое "
+        "описание: расскажи, о чём товар (для книги — сюжет/суть), чем он цепляет "
+        "и полезен покупателю.\n"
+        "Требования:\n"
+        "- начни с цепляющего первого предложения;\n"
+        "- эмоционально, вовлекающе, естественно — как человек советует другу;\n"
+        "- СТРОГО правдиво: не выдумывай фактов, имён, событий и цифр, которых нет "
+        "на фото; бери имена, названия и сюжет буквально с фото;\n"
+        "- если на фото что-то не читается или неоднозначно — не додумывай, напиши "
+        "обобщённо или опусти эту деталь;\n"
+        "- НЕ перечисляй характеристики списком и не дублируй их (автор, бренд, "
+        "ISBN, размеры, вес и т.п. — они уже указаны в карточке отдельно);\n"
+        "- 2-3 ключевых слова вплети органично для SEO;\n"
+        "- объём 300-700 символов.\n"
+        "Ответь только готовым текстом описания, без заголовков и пояснений.",
+    ),
+    (
+        "description:kit",
+        "Описание — комплект",
+        "description",
+        "kit",
+        "any",
+        "ru",
+        "deepseek-flash",
+        0.7,
+        "text",
+        "Составь описание товара-комплекта на русском языке. Перечисли состав "
+        "комплекта по данным {{characteristics}}, подчеркни выгоду покупки "
+        "набора целиком. Не выдумывай элементы, которых нет в данных.",
+    ),
+    (
+        "description:foreign",
+        "Описание — иностранный товар",
+        "description",
+        "foreign",
+        "any",
+        "ru",
+        "deepseek-flash",
+        0.7,
+        "text",
+        "Товар может содержать текст на иностранном языке. Переведи или "
+        "интерпретируй его и составь описание на русском языке на основе "
+        "{{characteristics}}. Сохрани фактические характеристики, не выдумывай.",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -266,6 +460,10 @@ CHARC_EXTRA_COLUMNS = {
 
 # Таблицы с составным ключом UNIQUE(ART, SUP).
 _ART_SUP_TABLES = ("status", "wb_products", "oz_products", "oz_archive")
+
+# Карточные таблицы, в которых ведётся мягкое удаление (is_deleted) и
+# хранится метка последней полной сверки (last_seen).
+_CARD_FLAG_TABLES = ("wb_products", "oz_products", "oz_archive")
 
 # Таблицы значений с составным ключом UNIQUE(ART, SUP, charcID).
 _EAV_TABLES = ("wb_product_values",)
@@ -424,6 +622,42 @@ def _create_tables(connection: sqlite3.Connection) -> None:
         """
     )
 
+    # Выбранные пользователем поля (конструктор) для категорий: JSON-список ключей
+    # полей, которые нужно показывать/собирать для категории subject_id.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS category_fields (
+            subject_id INTEGER PRIMARY KEY,
+            enabled_keys TEXT NOT NULL
+        )
+        """
+    )
+
+    # Промты для DeepSeek: служебные шаблоны system_prompt.
+    # task_type: 'extract' (точное извлечение характеристик) | 'description'
+    # (творческое описание). variant уточняет тип товара (standard/kit/foreign).
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            variant TEXT NOT NULL DEFAULT 'standard',
+            marketplace TEXT NOT NULL DEFAULT 'any',
+            lang TEXT NOT NULL DEFAULT 'ru',
+            model TEXT NOT NULL DEFAULT 'deepseek-flash',
+            temperature REAL NOT NULL DEFAULT 0.0,
+            response_format TEXT NOT NULL DEFAULT 'json',
+            prompt_text TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
     # Справочник характеристик из метода /content/v2/object/charcs/{subjectId}.
     cursor.execute(
         """
@@ -447,6 +681,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             ART TEXT NOT NULL,
             SUP TEXT,
             {_products_columns_sql()},
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            last_seen TEXT,
             UNIQUE(ART, SUP)
         )
         """
@@ -497,6 +733,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             ART TEXT NOT NULL,
             SUP TEXT,
             {_oz_products_columns_sql()},
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            last_seen TEXT,
             UNIQUE(ART, SUP)
         )
         """
@@ -510,6 +748,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
             ART TEXT NOT NULL,
             SUP TEXT,
             {_oz_products_columns_sql()},
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            last_seen TEXT,
             UNIQUE(ART, SUP)
         )
         """
@@ -574,6 +814,8 @@ def _create_tables(connection: sqlite3.Connection) -> None:
         """
     )
 
+    _migrate_card_flag_columns(connection)
+
     connection.commit()
 
 
@@ -631,6 +873,30 @@ def _migrate_product_columns(connection: sqlite3.Connection) -> list:
     if added:
         connection.commit()
 
+    return added
+
+
+def _migrate_card_flag_columns(connection: sqlite3.Connection) -> list:
+    """Добавляет колонки мягкого удаления в карточные таблицы (если их ещё нет).
+
+    is_deleted — признак «карточка удалена на площадке, но данные сохранены»;
+    last_seen — метка последней полной сверки, по которой определяются
+    отсутствующие в выгрузке карточки.
+    """
+    cursor = connection.cursor()
+    added = []
+    for table in _CARD_FLAG_TABLES:
+        existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+        if "is_deleted" not in existing:
+            cursor.execute(
+                f"ALTER TABLE {table} ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0"
+            )
+            added.append(f"{table}.is_deleted")
+        if "last_seen" not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN last_seen TEXT")
+            added.append(f"{table}.last_seen")
+    if added:
+        connection.commit()
     return added
 
 
@@ -716,6 +982,183 @@ def _seed_charcs(connection: sqlite3.Connection) -> list:
 
     connection.commit()
     return seeded
+
+
+def _seed_promts(connection: sqlite3.Connection) -> list:
+    """Наполняет таблицу promts базовыми промтами DeepSeek, если кодов нет.
+
+    Используется INSERT OR IGNORE по уникальному ключу code, поэтому при
+    повторных запусках уже добавленные промты не дублируются, а пользовательские
+    правки текста не затираются. Возвращает список кодов добавленных промтов.
+    """
+    cursor = connection.cursor()
+    seeded = []
+
+    for row in SEED_PROMTS:
+        (
+            code, name, task_type, variant, marketplace, lang, model,
+            temperature, response_format, prompt_text,
+        ) = row
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO promts (
+                code, name, task_type, variant, marketplace, lang, model,
+                temperature, response_format, prompt_text, is_active, sort_order
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+            """,
+            (
+                code, name, task_type, variant, marketplace, lang, model,
+                temperature, response_format, prompt_text,
+            ),
+        )
+        if cursor.rowcount:
+            seeded.append(code)
+
+    connection.commit()
+    return seeded
+
+
+def get_promt(code: str):
+    """Возвращает активный промт из таблицы promts по служебному ключу code.
+
+    Возвращает словарь с полями строки или None, если промт не найден или
+    отключён (is_active = 0). Используется другими модулями только для чтения.
+    """
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM promts WHERE code = ? AND is_active = 1",
+            (code,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        connection.close()
+
+
+def list_promts(task_type=None):
+    """Возвращает список промтов для UI/настроек (только чтение).
+
+    При task_type=None возвращает все промты, иначе — только указанного типа
+    ('extract' | 'description'). Сортировка по sort_order, затем по name.
+    """
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        connection.row_factory = sqlite3.Row
+        if task_type:
+            rows = connection.execute(
+                "SELECT * FROM promts WHERE task_type = ? ORDER BY sort_order, name",
+                (task_type,),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT * FROM promts ORDER BY task_type, sort_order, name"
+            ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        connection.close()
+
+
+def save_custom_promt(code, name, prompt_text, *, task_type="extract",
+                      variant="custom", marketplace="any", lang="ru",
+                      model="deepseek-flash", temperature=0.0,
+                      response_format="json"):
+    """Создаёт или обновляет пользовательский промт по уникальному коду.
+
+    Используется другими модулями для сохранения сгенерированных промтов
+    (например, индивидуальных промтов категорий). Не изменяет схему БД —
+    только вставляет или обновляет строку в таблице promts.
+    """
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        existing = connection.execute(
+            "SELECT id FROM promts WHERE code = ?", (code,)
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                """
+                INSERT INTO promts (
+                    code, name, task_type, variant, marketplace, lang, model,
+                    temperature, response_format, prompt_text, is_active,
+                    sort_order, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0,
+                          datetime('now'), datetime('now'))
+                """,
+                (
+                    code, name, task_type, variant, marketplace, lang, model,
+                    temperature, response_format, prompt_text,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE promts SET
+                    name = ?,
+                    task_type = ?,
+                    variant = ?,
+                    marketplace = ?,
+                    lang = ?,
+                    model = ?,
+                    temperature = ?,
+                    response_format = ?,
+                    prompt_text = ?,
+                    updated_at = datetime('now')
+                WHERE code = ?
+                """,
+                (
+                    name, task_type, variant, marketplace, lang, model,
+                    temperature, response_format, prompt_text, code,
+                ),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def get_category_fields(subject_id):
+    """Возвращает set включённых ключей полей категории или None, если выбор не сохранён.
+
+    None означает «выбор ещё не делался» (показывать все поля). Пустой set означает
+    «пользователь осознанно не выбрал ни одного поля».
+    """
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        row = connection.execute(
+            "SELECT enabled_keys FROM category_fields WHERE subject_id = ?",
+            (subject_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return None
+    try:
+        keys = json.loads(row[0] or "[]")
+    except ValueError:
+        return None
+    return set(keys) if isinstance(keys, list) else None
+
+
+def save_category_fields(subject_id, enabled_keys):
+    """Сохраняет выбранные поля категории (перезаписывает предыдущий выбор)."""
+    data = json.dumps(sorted(enabled_keys), ensure_ascii=False)
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        existing = connection.execute(
+            "SELECT 1 FROM category_fields WHERE subject_id = ?", (subject_id,)
+        ).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO category_fields (subject_id, enabled_keys) VALUES (?, ?)",
+                (subject_id, data),
+            )
+        else:
+            connection.execute(
+                "UPDATE category_fields SET enabled_keys = ? WHERE subject_id = ?",
+                (data, subject_id),
+            )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1135,11 +1578,15 @@ def _parse_json(response):
 # ---------------------------------------------------------------------------
 # Запись данных
 # ---------------------------------------------------------------------------
-def _upsert_product(db_cursor, art, sup, root_values):
+def _upsert_product(db_cursor, art, sup, root_values, sync_ts=None):
     """Вставляет или обновляет корневые параметры карточки в wb_products.
 
-    Помимо известных колонок CARD_ROOT_COLUMNS учитывает любые новые скалярные
-    поля из root_values: под них автоматически создаются колонки.
+    Сопоставление идёт в два этапа: сначала по текущей связке ART+SUP (это
+    актуальная строка), затем по стабильному nmID (карточку переименовали).
+    Такой порядок исключает нарушение UNIQUE(ART, SUP) при смене артикула и
+    корректно «воскрешает» данные при повторном появлении карточки. Помимо
+    известных колонок CARD_ROOT_COLUMNS учитываются новые скалярные поля из
+    root_values: под них автоматически создаются колонки.
     """
     columns = list(CARD_ROOT_COLUMNS)
     extra = [
@@ -1150,28 +1597,45 @@ def _upsert_product(db_cursor, art, sup, root_values):
         _ensure_product_columns(db_cursor, {name: root_values[name] for name in extra})
         columns.extend(extra)
 
+    nm_id = root_values.get("nmID")
+
+    # 1) Точное совпадение ART+SUP — актуальная строка.
     if sup is None:
         existing = db_cursor.execute(
-            "SELECT id FROM wb_products WHERE ART = ? AND SUP IS NULL", (art,)
+            "SELECT id, ART, SUP FROM wb_products WHERE ART = ? AND SUP IS NULL", (art,)
         ).fetchone()
     else:
         existing = db_cursor.execute(
-            "SELECT id FROM wb_products WHERE ART = ? AND SUP = ?", (art, sup)
+            "SELECT id, ART, SUP FROM wb_products WHERE ART = ? AND SUP = ?", (art, sup)
+        ).fetchone()
+
+    # 2) Карточку переименовали: ищем по стабильному nmID.
+    if existing is None and nm_id is not None:
+        existing = db_cursor.execute(
+            "SELECT id, ART, SUP FROM wb_products WHERE nmID = ?", (nm_id,)
         ).fetchone()
 
     if existing is None:
-        cols = ["ART", "SUP"] + columns
+        cols = ["ART", "SUP"] + columns + ["is_deleted", "last_seen"]
         placeholders = ", ".join(["?"] * len(cols))
         db_cursor.execute(
             f"INSERT INTO wb_products ({', '.join(cols)}) VALUES ({placeholders})",
-            [art, sup] + [root_values.get(col) for col in columns],
+            [art, sup] + [root_values.get(col) for col in columns] + [0, sync_ts],
         )
         return "insert"
 
+    old_id, old_art, old_sup = existing
+
+    # Если нашли по nmID (артикул/поставщик сменились) — чистим старые
+    # EAV-значения, чтобы не оставались «хвосты» под старой связкой ART+SUP.
+    if (old_art, old_sup) != (art, sup):
+        _delete_product_values(db_cursor, old_art, old_sup)
+
     assignments = ", ".join(f"{col} = ?" for col in columns)
     db_cursor.execute(
-        f"UPDATE wb_products SET {assignments} WHERE id = ?",
-        [root_values.get(col) for col in columns] + [existing[0]],
+        f"UPDATE wb_products SET ART = ?, SUP = ?, {assignments}, "
+        f"is_deleted = 0, last_seen = ? WHERE id = ?",
+        [art, sup] + [root_values.get(col) for col in columns] + [sync_ts, old_id],
     )
     return "update"
 
@@ -1335,7 +1799,7 @@ def _upsert_charc(db_cursor, charc, subject_id, subject_name):
     return "exists"
 
 
-def _process_card(db_cursor, card, categories, counters):
+def _process_card(db_cursor, card, categories, counters, sync_ts=None):
     """Обрабатывает одну карточку: wb_products + wb_product_values + категории."""
     art, sup = extract_art_sup(card.get("vendorCode"))
     if art is None:
@@ -1393,7 +1857,7 @@ def _process_card(db_cursor, card, categories, counters):
             _insert_product_value(db_cursor, art, sup, charc_id, field_name, value)
             counters["values_inserted"] += 1
 
-    return _upsert_product(db_cursor, art, sup, root_values)
+    return _upsert_product(db_cursor, art, sup, root_values, sync_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -1513,11 +1977,14 @@ def _ensure_oz_product_columns(db_cursor, values: dict) -> None:
             existing.add(name)
 
 
-def _upsert_oz_row(db_cursor, table, art, sup, root_values):
+def _upsert_oz_row(db_cursor, table, art, sup, root_values, sync_ts=None):
     """Вставляет или обновляет корневые параметры товара в таблице Ozon.
 
-    Помимо известных колонок OZ_PRODUCT_COLUMNS учитывает новые скалярные
-    поля из root_values: под них автоматически создаются колонки.
+    Сопоставление идёт в два этапа: сначала по текущей связке ART+SUP (это
+    актуальная строка), затем по стабильному product_id (offer_id сменился).
+    Такой порядок исключает нарушение UNIQUE(ART, SUP). Помимо известных колонок
+    OZ_PRODUCT_COLUMNS учитываются новые скалярные поля из root_values: под них
+    автоматически создаются колонки.
     `table` — строго "oz_products" либо "oz_archive" (внутренняя константа).
     """
     columns = list(OZ_PRODUCT_COLUMNS)
@@ -1529,30 +1996,46 @@ def _upsert_oz_row(db_cursor, table, art, sup, root_values):
         _ensure_oz_product_columns(db_cursor, {name: root_values[name] for name in extra})
         columns.extend(extra)
 
+    product_id = root_values.get("product_id")
+
+    # 1) Точное совпадение ART+SUP — актуальная строка.
     if sup is None:
         existing = db_cursor.execute(
-            f"SELECT id FROM {table} WHERE ART = ? AND SUP IS NULL", (art,)
+            f"SELECT id, ART, SUP FROM {table} WHERE ART = ? AND SUP IS NULL", (art,)
         ).fetchone()
     else:
         existing = db_cursor.execute(
-            f"SELECT id FROM {table} WHERE ART = ? AND SUP = ?", (art, sup)
+            f"SELECT id, ART, SUP FROM {table} WHERE ART = ? AND SUP = ?", (art, sup)
+        ).fetchone()
+
+    # 2) offer_id сменился: ищем по стабильному product_id.
+    if existing is None and product_id is not None:
+        existing = db_cursor.execute(
+            f"SELECT id, ART, SUP FROM {table} WHERE product_id = ?", (product_id,)
         ).fetchone()
 
     values = [root_values.get(col) for col in columns]
 
     if existing is None:
-        cols = ["ART", "SUP"] + columns
+        cols = ["ART", "SUP"] + columns + ["is_deleted", "last_seen"]
         placeholders = ", ".join(["?"] * len(cols))
         db_cursor.execute(
             f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})",
-            [art, sup] + values,
+            [art, sup] + values + [0, sync_ts],
         )
         return "insert"
 
+    old_id, old_art, old_sup = existing
+
+    # Если нашли по product_id (offer_id сменился) — чистим старые EAV-значения.
+    if (old_art, old_sup) != (art, sup):
+        _delete_oz_product_values(db_cursor, old_art, old_sup)
+
     assignments = ", ".join(f"{col} = ?" for col in columns)
     db_cursor.execute(
-        f"UPDATE {table} SET {assignments} WHERE id = ?",
-        values + [existing[0]],
+        f"UPDATE {table} SET ART = ?, SUP = ?, {assignments}, "
+        f"is_deleted = 0, last_seen = ? WHERE id = ?",
+        [art, sup] + values + [sync_ts, old_id],
     )
     return "update"
 
@@ -1678,7 +2161,7 @@ def _upsert_oz_charc(db_cursor, attr):
          dictionary_id, max_value_count, group_name, attribute_id),
     )
     return "update"
-def _process_oz_card(db_cursor, item, categories, counters):
+def _process_oz_card(db_cursor, item, categories, counters, sync_ts=None):
     """Обрабатывает один товар Ozon: раскладывает в oz_products/oz_archive.
 
     Активные карточки пишутся в oz_products (+ вложенные поля в oz_product_values),
@@ -1717,7 +2200,7 @@ def _process_oz_card(db_cursor, item, categories, counters):
         # Переезд в архив: чистим активную запись и её значения.
         _delete_oz_row(db_cursor, "oz_products", art, sup)
         _delete_oz_product_values(db_cursor, art, sup)
-        result = _upsert_oz_row(db_cursor, "oz_archive", art, sup, root_values)
+        result = _upsert_oz_row(db_cursor, "oz_archive", art, sup, root_values, sync_ts)
         return f"archive_{result}" if result else None
 
     # Активная карточка: убираем возможный старый архивный снимок.
@@ -1729,7 +2212,7 @@ def _process_oz_card(db_cursor, item, categories, counters):
             _insert_oz_product_value(db_cursor, art, sup, attribute_id, field_name, value)
             counters["values_inserted"] += 1
 
-    result = _upsert_oz_row(db_cursor, "oz_products", art, sup, root_values)
+    result = _upsert_oz_row(db_cursor, "oz_products", art, sup, root_values, sync_ts)
     return f"product_{result}" if result else None
 
 
@@ -1802,11 +2285,35 @@ def _process_oz_attributes_item(db_cursor, item, counters):
     return written
 
 
-def _sync_oz(connection):
+def _mark_missing_wb_deleted(connection, sync_ts):
+    """Помечает карточки WB, не встретившиеся в полной выгрузке, как удалённые."""
+    db_cursor = connection.cursor()
+    db_cursor.execute(
+        "UPDATE wb_products SET is_deleted = 1 "
+        "WHERE is_deleted = 0 AND (last_seen IS NULL OR last_seen != ?)",
+        (sync_ts,),
+    )
+    connection.commit()
+
+
+def _mark_missing_oz_deleted(connection, sync_ts):
+    """Помечает товары Ozon, не встретившиеся в полной выгрузке, как удалённые."""
+    db_cursor = connection.cursor()
+    for table in ("oz_products", "oz_archive"):
+        db_cursor.execute(
+            f"UPDATE {table} SET is_deleted = 1 "
+            "WHERE is_deleted = 0 AND (last_seen IS NULL OR last_seen != ?)",
+            (sync_ts,),
+        )
+    connection.commit()
+
+
+def _sync_oz(connection, is_full=False, sync_ts=None):
     """Синхронизирует таблицы Ozon (необязательный этап инициализации).
 
     Если токен Ozon или Client-Id не заполнены — этап молча пропускается,
-    чтобы не ломать выгрузку Wildberries.
+    чтобы не ломать выгрузку Wildberries. При полной выгрузке (is_full=True)
+    товары, не встретившиеся в списке Ozon, помечаются как удалённые.
     """
     oz_api_key = get_oz_token()
     oz_client_id = get_oz_client_id()
@@ -1860,7 +2367,7 @@ def _sync_oz(connection):
             data = _fetch_oz_product_info_list(session, batch)
             for item in (data.get("items") or []):
                 counters["items"] += 1
-                outcome = _process_oz_card(db_cursor, item, categories, counters)
+                outcome = _process_oz_card(db_cursor, item, categories, counters, sync_ts)
                 if outcome == "product_insert":
                     counters["products_inserted"] += 1
                 elif outcome == "product_update":
@@ -1897,6 +2404,9 @@ def _sync_oz(connection):
             f"oz_product_values(+{counters['values_inserted']}), "
             f"oz_charcs(+{counters['charcs_inserted']}/~{counters['charcs_updated']})."
         )
+        if is_full and sync_ts:
+            _mark_missing_oz_deleted(connection, sync_ts)
+
         _logger.info("Ozon: синхронизация завершена (%s).", counters)
     finally:
         session.close()
@@ -2003,6 +2513,7 @@ def refresh_wb_cards() -> bool:
         _drop_obsolete_product_columns(connection)
         _create_unique_indexes(connection)
         _seed_charcs(connection)
+        _seed_promts(connection)
 
         categories = {}
         db_cursor = connection.cursor()
@@ -2053,6 +2564,28 @@ def refresh_wb_cards() -> bool:
         connection.close()
 
 
+def write_last_update() -> None:
+    """Записывает текущее время как метку последнего обновления БД."""
+    try:
+        with open(LAST_UPDATE_PATH, "w", encoding="utf-8") as file:
+            json.dump({"updated_at": time.time()}, file, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        _logger.warning("Не удалось записать метку обновления БД: %s", exc)
+
+
+def read_last_update() -> float:
+    """Возвращает epoch-время последнего обновления БД (0.0, если метки нет)."""
+    try:
+        if not os.path.exists(LAST_UPDATE_PATH):
+            return 0.0
+        with open(LAST_UPDATE_PATH, "r", encoding="utf-8") as file:
+            data = json.load(file)
+        return float(data.get("updated_at") or 0.0)
+    except (OSError, ValueError, TypeError) as exc:
+        _logger.warning("Не удалось прочитать метку обновления БД: %s", exc)
+        return 0.0
+
+
 def run() -> None:
     """Главная функция модуля. Вызывается лаунчером в отдельном потоке."""
     _configure_logging()
@@ -2091,6 +2624,7 @@ def run() -> None:
         _drop_obsolete_product_columns(connection)
         _create_unique_indexes(connection)
         _seed_charcs(connection)
+        _seed_promts(connection)
 
         print(f"[DBase] База данных создана/открыта: {DB_PATH}")
         _logger.info("База данных создана/открыта: %s", DB_PATH)
@@ -2104,10 +2638,16 @@ def run() -> None:
         # 3. Выгрузка карточек (Шаг 1 и 2).
         # Сортировка по возрастанию + сохранённый cursor дают инкрементальную
         # выгрузку: при первом запуске выкачиваются все карточки, при следующих —
-        # только созданные/обновлённые после предыдущей выгрузки.
+        # только созданные/обновлённые после предыдущей выгрузки. Сверка «кого
+        # нет в выгрузке → DELETED» выполняется только при полной выгрузке
+        # (когда курсор отсутствует), потому что инкрементальный поток WB не
+        # сообщает об удалённых карточках.
         categories = {}
         db_cursor = connection.cursor()
-        cursor_state = _load_cursor() or {"limit": CARDS_PAGE_SIZE}
+        loaded_cursor = _load_cursor()
+        is_full = loaded_cursor is None
+        sync_ts = time.strftime("%Y-%m-%d %H:%M:%S") if is_full else None
+        cursor_state = loaded_cursor or {"limit": CARDS_PAGE_SIZE}
 
         while True:
             data, cursor_state = _fetch_cards_page(session, cursor_state)
@@ -2117,7 +2657,7 @@ def run() -> None:
 
             for card in cards:
                 counters["cards"] += 1
-                result = _process_card(db_cursor, card, categories, counters)
+                result = _process_card(db_cursor, card, categories, counters, sync_ts)
                 if result == "insert":
                     counters["products_inserted"] += 1
                 elif result == "update":
@@ -2154,6 +2694,9 @@ def run() -> None:
             "Выгрузка карточек завершена. Уникальных категорий: %d", len(categories)
         )
 
+        if is_full:
+            _mark_missing_wb_deleted(connection, sync_ts)
+
         # 4. Синхронизация справочника характеристик (Шаг 3 и 4).
         charcs_inserted = 0
         charcs_updated = 0
@@ -2171,7 +2714,8 @@ def run() -> None:
                 )
                 continue
 
-            characteristics = _parse_json(response)
+            payload = _parse_json(response)
+            characteristics = payload.get("data") if isinstance(payload, dict) else payload
             if not isinstance(characteristics, list):
                 continue
 
@@ -2189,7 +2733,7 @@ def run() -> None:
         )
 
         # 5. Синхронизация Ozon (необязательная — пропускается без токена/Client-Id).
-        _sync_oz(connection)
+        _sync_oz(connection, is_full, sync_ts)
 
         elapsed = time.perf_counter() - started
         print(f"[DBase] Скачано карточек: {counters['cards']}")
@@ -2216,6 +2760,7 @@ def run() -> None:
             session.close()
         connection.close()
 
+    write_last_update()
     print("[DBase] Finished successfully.")
 
 

@@ -88,6 +88,7 @@ YOUR_TELEGRAM_ID = _env("YOUR_TELEGRAM_ID")
 TELEGRAM_GROUP_ID = _env("TELEGRAM_GROUP_ID")
 TELEGRAM_ORDERS_GROUP_ID = _env("TELEGRAM_ORDERS_GROUP_ID")
 TELEGRAM_CANCELS_GROUP_ID = _env("TELEGRAM_CANCELS_GROUP_ID")
+TELEGRAM_ORDER_BUTTON_GROUP_ID = _env("TELEGRAM_ORDER_BUTTON_GROUP_ID") or TELEGRAM_ORDERS_GROUP_ID
 OZON_ENABLED = _env("OZON_ENABLED", "false").lower() == "true"
 NOTIFICATIONS_ENABLED = _env("NOTIFICATIONS_ENABLED", "true").lower() == "true"
 
@@ -411,7 +412,7 @@ def oz_offer_exists(offer_id: str) -> bool:
     conn = db_connect()
     try:
         row = conn.execute(
-            "SELECT 1 FROM oz_products WHERE offer_id = ? LIMIT 1", (offer_id,)
+            "SELECT 1 FROM oz_products WHERE offer_id = ? AND is_deleted = 0 LIMIT 1", (offer_id,)
         ).fetchone()
         return row is not None
     finally:
@@ -530,14 +531,18 @@ class TelegramClient:
     def _chat(self, chat_id) -> str:
         return str(chat_id or TELEGRAM_GROUP_ID or YOUR_TELEGRAM_ID or "")
 
-    async def send_message(self, text: str, chat_id=None) -> None:
+    async def send_message(self, text: str, chat_id=None, reply_markup=None, parse_mode="HTML") -> None:
         if not NOTIFICATIONS_ENABLED:
             return
         chat = self._chat(chat_id)
         if not chat:
             return
         url = f"{TG_API_BASE}/sendMessage"
-        payload = {"chat_id": chat, "text": text, "parse_mode": "HTML"}
+        payload = {"chat_id": chat, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         for _ in range(3):
             try:
                 async with self.session.post(url, json=payload) as resp:
@@ -550,7 +555,7 @@ class TelegramClient:
                 await asyncio.sleep(2)
         return
 
-    async def send_photo(self, caption: str, photo_url: str, chat_id=None) -> None:
+    async def send_photo(self, caption: str, photo_url: str, chat_id=None, reply_markup=None, parse_mode="HTML") -> None:
         if not NOTIFICATIONS_ENABLED:
             return
         chat = self._chat(chat_id)
@@ -558,13 +563,16 @@ class TelegramClient:
             return
         image = await self._download(photo_url)
         if image is None:
-            await self.send_message(caption, chat_id)
+            await self.send_message(caption, chat_id, reply_markup=reply_markup, parse_mode=parse_mode)
             return
         url = f"{TG_API_BASE}/sendPhoto"
         data = aiohttp.FormData()
         data.add_field("chat_id", chat)
         data.add_field("caption", caption)
-        data.add_field("parse_mode", "HTML")
+        if parse_mode:
+            data.add_field("parse_mode", parse_mode)
+        if reply_markup:
+            data.add_field("reply_markup", json.dumps(reply_markup, ensure_ascii=False))
         data.add_field("photo", image, filename="photo.jpg", content_type="image/jpeg")
         for _ in range(3):
             try:
@@ -590,6 +598,26 @@ class TelegramClient:
         except (aiohttp.ClientError, asyncio.TimeoutError):
             pass
         return None
+
+    async def answer_callback(self, callback_query_id: str, text: str | None = None) -> None:
+        """Отвечает на inline-кнопку, чтобы убрать «часики» на кнопке."""
+        if not NOTIFICATIONS_ENABLED:
+            return
+        url = f"{TG_API_BASE}/answerCallbackQuery"
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        for _ in range(3):
+            try:
+                async with self.session.post(url, json=payload) as resp:
+                    if resp.status == 429:
+                        await asyncio.sleep(_tg_retry_after(await resp.text()) or 5)
+                        continue
+                    return
+            except aiohttp.ClientError as exc:
+                logger.warning("Telegram answerCallbackQuery: %s", exc)
+                await asyncio.sleep(2)
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +906,22 @@ class Bot:
             await self.tg.send_photo(msg, order["photo_url"], chat_id=TELEGRAM_ORDERS_GROUP_ID)
         else:
             await self.tg.send_message(msg, chat_id=TELEGRAM_ORDERS_GROUP_ID)
+
+        # Дублируем уведомление в личный чат владельца с кнопкой «Заказать».
+        if YOUR_TELEGRAM_ID:
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "Заказать", "callback_data": f"order:{order['id']}"}]
+                ]
+            }
+            if order.get("photo_url"):
+                await self.tg.send_photo(
+                    msg, order["photo_url"], chat_id=YOUR_TELEGRAM_ID, reply_markup=keyboard
+                )
+            else:
+                await self.tg.send_message(
+                    msg, chat_id=YOUR_TELEGRAM_ID, reply_markup=keyboard
+                )
 
     async def check_wb(self) -> None:
         await self.reconcile_orders()
@@ -1254,6 +1298,56 @@ async def handle_command(bot: Bot, chat_id, text: str, stop_event: asyncio.Event
         stop_event.set()
 
 
+async def handle_callback(bot: Bot, callback_query: dict) -> None:
+    """Обрабатывает нажатия inline-кнопок Telegram (кнопка «Заказать»)."""
+    cq_id = callback_query.get("id")
+    if not cq_id:
+        return
+
+    data = callback_query.get("data") or ""
+    from_id = callback_query.get("from", {}).get("id")
+    logger.info("Callback получен: data=%r from=%s", data, from_id)
+
+    # Кнопки нажимает только владелец бота.
+    if YOUR_TELEGRAM_ID and str(from_id) != str(YOUR_TELEGRAM_ID):
+        await bot.tg.answer_callback(cq_id)
+        return
+
+    if data.startswith("order:"):
+        try:
+            oid = int(data.split(":", 1)[1])
+        except ValueError:
+            await bot.tg.answer_callback(cq_id)
+            return
+
+        article = Bot._wb_article(oid)
+        if not article:
+            await bot.tg.answer_callback(cq_id, "Артикул не найден")
+            return
+
+        card = get_card(article)
+        title = (card.get("title") or "").strip()
+        msg = f"Арт. {article}"
+        if title:
+            msg += f"\n{title}"
+
+        logger.info("Отправка заказа oid=%s в группу %s", oid, TELEGRAM_ORDER_BUTTON_GROUP_ID)
+        if card.get("photo_url"):
+            await bot.tg.send_photo(
+                msg, card["photo_url"],
+                chat_id=TELEGRAM_ORDER_BUTTON_GROUP_ID,
+                parse_mode=None,
+            )
+        else:
+            await bot.tg.send_message(
+                msg, chat_id=TELEGRAM_ORDER_BUTTON_GROUP_ID, parse_mode=None
+            )
+        await bot.tg.answer_callback(cq_id, "Отправлено в группу")
+        return
+
+    await bot.tg.answer_callback(cq_id)
+
+
 async def telegram_poll(bot: Bot, stop_event: asyncio.Event) -> None:
     offset = load_telegram_offset()
     while not stop_event.is_set():
@@ -1267,6 +1361,10 @@ async def telegram_poll(bot: Bot, stop_event: asyncio.Event) -> None:
             for update in data.get("result") or []:
                 offset = update["update_id"] + 1
                 save_telegram_offset(offset)
+                callback = update.get("callback_query")
+                if callback:
+                    await handle_callback(bot, callback)
+                    continue
                 msg = update.get("message") or {}
                 text = msg.get("text") or ""
                 chat_id = msg.get("chat", {}).get("id")

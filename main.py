@@ -16,6 +16,7 @@ import queue
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import customtkinter as ctk
@@ -32,6 +33,11 @@ BOT_LOG_DIR = DATA_DIR / "logs"
 
 # Максимум строк, отображаемых в консоли логов (защита от разрастания GUI).
 MAX_CONSOLE_LINES = 10000
+
+# Час суток (по локальному времени), в который выполняется полная сверка БД
+# (сброс курсора + полная выгрузка с пометкой удалённых карточек), если
+# программа работает без перезапуска.
+DAILY_FULL_SYNC_HOUR = 8
 
 # Служебные папки создаём автоматически, чтобы проект сразу был готов к работе.
 APPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -138,6 +144,7 @@ class LauncherApp(ctk.CTk):
 
         # Планировщик автозапуска DBase и модальное окно настроек.
         self._dbase_timer_id = None
+        self._daily_full_sync_timer_id = None
         self._settings_window = None
         self._dbase_settings_button = None
         self._dbase_refresh_button = None
@@ -590,13 +597,16 @@ class LauncherApp(ctk.CTk):
 
     # -------------------- Автозапуск и таймер DBase ---------------------
     def _setup_dbase_scheduler(self) -> None:
-        """Настраивает автозапуск DBase при старте и цикличный таймер."""
+        """Настраивает автозапуск DBase при старте, ежедневную сверку и таймер."""
         if self.config.get("dbase_auto_start"):
             dbase_path = APPS_DIR / "DBase.py"
             if dbase_path.exists():
                 # Небольшая задержка, чтобы окно успело отрисоваться до запуска.
-                self.after(500, lambda: self._start_module(dbase_path))
+                # При старте выполняется полная сверка (сброс курсора), т.к. пока
+                # программа была выключена, на площадке могли удалить карточки.
+                self.after(500, lambda: self._trigger_full_sync())
         self._schedule_dbase_timer()
+        self._schedule_daily_full_sync()
 
     def _dbase_interval_ms(self) -> int:
         """Возвращает интервал перезапуска DBase в миллисекундах."""
@@ -622,14 +632,74 @@ class LauncherApp(ctk.CTk):
         )
 
     def _on_dbase_timer(self) -> None:
-        """Срабатывает по таймеру: перезапускает DBase, если он не выполняется."""
+        """Срабатывает по таймеру: перезапускает DBase, если он не выполняется.
+
+        Пропускает запуск, если DBase уже обновлялся недавно (метка времени в
+        data/dbase_last_update.json), чтобы не делать лишнюю выгрузку — например,
+        сразу после создания карточки в Cards Creator.
+        """
         self._dbase_timer_id = None
         dbase_path = APPS_DIR / "DBase.py"
         if dbase_path.exists():
+            interval_s = self._dbase_interval_ms() / 1000.0
+            last = DBase.read_last_update()
+            elapsed_s = time.time() - last if last else None
+            if elapsed_s is not None and elapsed_s < interval_s:
+                # До планового запуска ещё не накопился интервал — откладываем.
+                remaining_ms = max(int((interval_s - elapsed_s) * 1000), 1000)
+                self._dbase_timer_id = self.after(remaining_ms, self._on_dbase_timer)
+                return
             # Если модуль уже выполняется, _start_module вернёт False и копия
             # не запустится; следующий цикл наступит по расписанию.
             self._start_module(dbase_path)
         self._schedule_dbase_timer()
+
+    # ---------------------- Полная сверка БД (DELETED) ----------------------
+    def _trigger_full_sync(self) -> None:
+        """Сбрасывает курсор и запускает полную выгрузку DBase (со сверкой удалений).
+
+        Используется при старте и раз в сутки. В отличие от ручной кнопки 🔄
+        (модуль _Full_Update) не запрашивает подтверждение у пользователя.
+        """
+        dbase_path = APPS_DIR / "DBase.py"
+        if not dbase_path.exists():
+            return
+        if "DBase" in self._running_modules or "_Full_Update" in self._running_modules:
+            return
+
+        # Удаляем файл курсора, чтобы DBase выполнил полную выгрузку и сверку.
+        cursor_path = DATA_DIR / "wb_cards_cursor.json"
+        try:
+            if cursor_path.exists():
+                cursor_path.unlink()
+        except OSError as exc:
+            self._set_status(f"Не удалось сбросить курсор: {exc}")
+            return
+
+        self._start_module(dbase_path)
+
+    def _schedule_daily_full_sync(self) -> None:
+        """Планирует ежедневную полную сверку в DAILY_FULL_SYNC_HOUR."""
+        now = datetime.now()
+        next_run = now.replace(
+            hour=DAILY_FULL_SYNC_HOUR, minute=0, second=0, microsecond=0
+        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        delay_ms = int((next_run - now).total_seconds() * 1000)
+
+        if self._daily_full_sync_timer_id is not None:
+            try:
+                self.after_cancel(self._daily_full_sync_timer_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._daily_full_sync_timer_id = self.after(delay_ms, self._on_daily_full_sync)
+
+    def _on_daily_full_sync(self) -> None:
+        """Срабатывает раз в сутки: запускает полную сверку и перенастраивается."""
+        self._daily_full_sync_timer_id = None
+        self._trigger_full_sync()
+        self._schedule_daily_full_sync()
 
     # ----------------------- Настройки лаунчера ---------------------
     def _open_settings(self) -> None:

@@ -109,7 +109,7 @@ def _search_products(conn: sqlite3.Connection, query: str):
 
     if art and sup is None:
         rows = conn.execute(
-            _SEARCH_BASE + " WHERE nmID IS NOT NULL AND ART = ? ORDER BY vendorCode",
+            _SEARCH_BASE + " WHERE nmID IS NOT NULL AND is_deleted = 0 AND ART = ? ORDER BY vendorCode",
             (art,),
         ).fetchall()
         if rows:
@@ -117,14 +117,14 @@ def _search_products(conn: sqlite3.Connection, query: str):
 
     rows = conn.execute(
         _SEARCH_BASE
-        + " WHERE nmID IS NOT NULL AND vendorCode = ? COLLATE NOCASE ORDER BY vendorCode",
+        + " WHERE nmID IS NOT NULL AND is_deleted = 0 AND vendorCode = ? COLLATE NOCASE ORDER BY vendorCode",
         (q,),
     ).fetchall()
     if rows:
         return rows
 
     rows = conn.execute(
-        _SEARCH_BASE + " WHERE nmID IS NOT NULL AND vendorCode LIKE ? ORDER BY vendorCode",
+        _SEARCH_BASE + " WHERE nmID IS NOT NULL AND is_deleted = 0 AND vendorCode LIKE ? ORDER BY vendorCode",
         (f"%{q}%",),
     ).fetchall()
     return rows

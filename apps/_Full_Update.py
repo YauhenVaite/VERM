@@ -7,6 +7,7 @@
 изменения схемы БД или появления новых полей у уже существующих карточек.
 """
 
+import importlib
 import os
 import sys
 import threading
@@ -101,6 +102,10 @@ def run() -> None:
 
     print("[Full Update] Запускаю полное обновление базы данных…")
     try:
+        # Лаунчер кэширует apps.DBase при импорте (main.py). Перезагружаем модуль,
+        # чтобы полная выгрузка выполнялась актуальной версией кода, а не старой
+        # копией из sys.modules.
+        importlib.reload(DBase)
         DBase.run()
     except Exception as exc:  # noqa: BLE001
         print(f"[Full Update] Ошибка обновления БД: {exc}")
